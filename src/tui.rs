@@ -190,9 +190,17 @@ impl App {
                 self.push(format!("{prefix} {short}"), Kind::Tool);
             }
             AgentEvent::AssistantDone { text } => {
-                self.flush_pending();
-                if !text.trim().is_empty() {
-                    self.push(text, Kind::Assistant);
+                let streamed = self.pending.take();
+                match streamed {
+                    Some(p) if !p.text.trim().is_empty() => {
+                        self.entries.push(p);
+                        self.scroll_from_bottom = 0;
+                    }
+                    _ => {
+                        if !text.trim().is_empty() {
+                            self.push(text, Kind::Assistant);
+                        }
+                    }
                 }
                 self.busy = false;
                 self.status = "idle".to_string();
@@ -502,8 +510,15 @@ mod tests {
         assert_eq!(app.pending.as_ref().unwrap().text, "Hello");
         app.on_event(AgentEvent::AssistantDone { text: "Hello".into() });
         assert!(app.pending.is_none());
-        assert_eq!(app.entries.last().unwrap().text, "Hello");
+        assert_eq!(app.entries.iter().filter(|e| e.text == "Hello").count(), 1);
         assert!(!app.busy);
+    }
+
+    #[test]
+    fn assistant_done_without_streaming_pushes_once() {
+        let mut app = App::new();
+        app.on_event(AgentEvent::AssistantDone { text: "Direct".into() });
+        assert_eq!(app.entries.iter().filter(|e| e.text == "Direct").count(), 1);
     }
 
     #[test]
@@ -541,5 +556,32 @@ mod wrap_tests {
         assert_eq!(w, vec!["abc", "def", "gh"]);
         assert_eq!(wrap_text("a\nb", 10), vec!["a", "b"]);
         assert_eq!(wrap_text("", 10), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod draw_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn draws_entries_and_pending() {
+        let mut app = App::new();
+        app.push("first user message", Kind::User);
+        app.on_event(AgentEvent::TextDelta("streaming answer".into()));
+        let mut backend = TestBackend::new(80, 12);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.draw(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let content: String = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("first user message"), "{content}");
+        assert!(content.contains("streaming answer"), "{content}");
     }
 }
