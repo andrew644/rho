@@ -22,6 +22,7 @@ async fn live_simple_chat() {
             200,
             Some(0.0),
             None,
+            None,
         )
         .await
         .unwrap();

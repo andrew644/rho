@@ -7,6 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use futures_util::StreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{AgentCommand, AgentEvent};
@@ -229,13 +231,18 @@ impl App {
         }
     }
 
-    pub fn handle_key(&mut self, key: event::KeyEvent, agent: &mpsc::UnboundedSender<AgentCommand>) -> bool {
+    pub fn handle_key(
+        &mut self,
+        key: event::KeyEvent,
+        agent: &mpsc::UnboundedSender<AgentCommand>,
+        cancel: &Arc<AtomicBool>,
+    ) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
         }
         match key.code {
             KeyCode::Esc => {
-                let _ = agent.send(AgentCommand::Interrupt);
+                cancel.store(true, Ordering::SeqCst);
                 self.push("interrupt requested", Kind::Info);
                 false
             }
@@ -433,10 +440,11 @@ impl App {
 
 pub async fn run(
     agent: mpsc::UnboundedSender<AgentCommand>,
+    cancel: Arc<AtomicBool>,
     mut events: broadcast::Receiver<AgentEvent>,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    let result = run_inner(&mut terminal, agent, &mut events).await;
+    let result = run_inner(&mut terminal, agent, cancel, &mut events).await;
     ratatui::restore();
     result
 }
@@ -444,6 +452,7 @@ pub async fn run(
 async fn run_inner(
     terminal: &mut ratatui::DefaultTerminal,
     agent: mpsc::UnboundedSender<AgentCommand>,
+    cancel: Arc<AtomicBool>,
     events: &mut broadcast::Receiver<AgentEvent>,
 ) -> anyhow::Result<()> {
     let mut app = App::new();
@@ -462,7 +471,7 @@ async fn run_inner(
             }
             maybe_key = keys.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_key {
-                    if app.handle_key(key, &agent) {
+                    if app.handle_key(key, &agent, &cancel) {
                         break;
                     }
                 }
@@ -533,15 +542,16 @@ mod tests {
     #[test]
     fn editing_moves_cursor_and_inserts() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut app = App::new();
         let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
-        app.handle_key(key(KeyCode::Char('b')), &tx);
-        app.handle_key(key(KeyCode::Char('c')), &tx);
-        app.handle_key(key(KeyCode::Left), &tx);
-        app.handle_key(key(KeyCode::Char('a')), &tx);
+        app.handle_key(key(KeyCode::Char('b')), &tx, &cancel);
+        app.handle_key(key(KeyCode::Char('c')), &tx, &cancel);
+        app.handle_key(key(KeyCode::Left), &tx, &cancel);
+        app.handle_key(key(KeyCode::Char('a')), &tx, &cancel);
         assert_eq!(app.input, "bac");
         assert_eq!(app.cursor, 2);
-        app.handle_key(key(KeyCode::Backspace), &tx);
+        app.handle_key(key(KeyCode::Backspace), &tx, &cancel);
         assert_eq!(app.input, "bc");
     }
 }

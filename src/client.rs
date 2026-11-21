@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -173,6 +175,7 @@ impl Client {
         max_tokens: u32,
         temperature: Option<f32>,
         events: Option<UnboundedSender<StreamEvent>>,
+        cancel: Option<Arc<AtomicBool>>,
     ) -> Result<AssistantMessage> {
         let mut body = serde_json::json!({
             "model": model,
@@ -208,6 +211,9 @@ impl Client {
         let mut announced_tools: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         while let Some(bytes) = resp.chunk().await? {
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                bail!("interrupted");
+            }
             let text = String::from_utf8_lossy(&bytes);
             buf.push_str(&text);
             while let Some(pos) = buf.find('\n') {

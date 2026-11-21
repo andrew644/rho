@@ -108,7 +108,7 @@ impl Agent {
                     let _ = fwd.send(ae);
                 }
             });
-            let assistant = self
+            let assistant = match self
                 .client
                 .stream_chat(
                     &self.config.model.id,
@@ -117,8 +117,19 @@ impl Agent {
                     self.config.model.max_tokens,
                     None,
                     Some(stx),
+                    Some(self.cancel.clone()),
                 )
-                .await?;
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    forwarder.abort();
+                    if self.cancelled() {
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
             forwarder.abort();
 
             if assistant.finish_reason.as_deref() == Some("length") {
@@ -253,9 +264,14 @@ impl Agent {
         messages.push(Message::user(prompt));
         let answer = self
             .client
-            .stream_chat(&self.config.model.id, &messages, &[], 8, Some(0.0), None)
+            .stream_chat(&self.config.model.id, &messages, &[], 128, Some(0.0), None, None)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(answer.content.trim().to_uppercase().starts_with("YES"))
+        let text = if answer.content.trim().is_empty() {
+            answer.reasoning.as_str()
+        } else {
+            answer.content.as_str()
+        };
+        Ok(text.trim().to_uppercase().contains("YES"))
     }
 }
