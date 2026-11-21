@@ -21,7 +21,7 @@ pub struct Client {
 }
 
 #[derive(Debug, Deserialize)]
-struct Chunk {
+pub(crate) struct Chunk {
     choices: Vec<ChunkChoice>,
     #[serde(default)]
     usage: Option<Usage>,
@@ -72,7 +72,7 @@ pub struct AssistantAccumulator {
 }
 
 impl AssistantAccumulator {
-    pub fn push_chunk(&mut self, chunk: &Chunk) -> (Vec<String>, Vec<String>, Vec<usize>) {
+    pub(crate) fn push_chunk(&mut self, chunk: &Chunk) -> (Vec<String>, Vec<String>, Vec<usize>) {
         let mut text = Vec::new();
         let mut reasoning = Vec::new();
         let mut new_tools = Vec::new();
@@ -143,7 +143,7 @@ impl AssistantAccumulator {
     }
 }
 
-pub fn parse_sse_line(line: &str) -> Result<Option<Chunk>> {
+pub(crate) fn parse_sse_line(line: &str) -> Result<Option<Chunk>> {
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(None);
     };

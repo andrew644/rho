@@ -106,6 +106,8 @@ loop:
 6. [x] `prompt` module: system prompt + AGENTS.md context + tests
 7. [x] `agent` module: serial event loop, tool execution, events + tests
 8. [x] `loop` module: loop specs/parsing/condition check + tests
-9. [ ] `tui` module: ratatui app, slash commands incl. /loop, integrate agent
-10. [ ] `discord` module: gateway client + bridge + tests for pure parts
-11. [ ] End-to-end smoke test against the local server; final commit
+9. [x] `tui` module: ratatui app, slash commands incl. /loop, integrate agent
+10. [x] `discord` module: gateway client + bridge + tests for pure parts
+11. [ ] End-to-end smoke test against the local server
+12. [ ] Compare features in Pi and Rho and document what still needs to be implemented.
+13. [ ] Continue implementing features from Pi until parity is met.

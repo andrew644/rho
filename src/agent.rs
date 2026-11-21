@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::json;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::client::{Client, StreamEvent};
@@ -43,7 +44,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn spawn(config: Config, cwd: PathBuf, events: UnboundedSender<AgentEvent>) -> (UnboundedSender<AgentCommand>, Arc<AtomicBool>) {
+    pub fn spawn(config: Config, cwd: PathBuf, events: broadcast::Sender<AgentEvent>) -> (UnboundedSender<AgentCommand>, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut agent = Agent {
             client: Client::new(&config.provider.base_url, &config.provider.api_key),
@@ -82,14 +83,14 @@ impl Agent {
         self.cancel.load(Ordering::SeqCst)
     }
 
-    async fn run_turn(&mut self, user_text: &str, events: &UnboundedSender<AgentEvent>) {
+    async fn run_turn(&mut self, user_text: &str, events: &broadcast::Sender<AgentEvent>) {
         self.history.push(Message::user(user_text));
         if let Err(e) = self.drive(events).await {
             let _ = events.send(AgentEvent::Error(e.to_string()));
         }
     }
 
-    async fn drive(&mut self, events: &UnboundedSender<AgentEvent>) -> anyhow::Result<()> {
+    async fn drive(&mut self, events: &broadcast::Sender<AgentEvent>) -> anyhow::Result<()> {
         let specs = self.tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
         for _ in 0..self.config.loop_config.max_turns_per_run {
             if self.cancelled() {
@@ -199,7 +200,7 @@ impl Agent {
             .map_err(|e| format!("tool task failed: {e}"))
     }
 
-    async fn run_loop(&mut self, spec: &LoopSpec, events: &UnboundedSender<AgentEvent>) {
+    async fn run_loop(&mut self, spec: &LoopSpec, events: &broadcast::Sender<AgentEvent>) {
         let _ = events.send(AgentEvent::LoopStarted {
             description: spec.describe_mode(),
         });
