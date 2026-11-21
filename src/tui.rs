@@ -391,8 +391,7 @@ impl App {
                 let input = std::mem::take(&mut self.input);
                 self.cursor = 0;
                 self.history_index = None;
-                self.on_submit(&input, agent);
-                false
+                self.on_submit(&input, agent)
             }
             KeyCode::Backspace => {
                 let mut chars: Vec<char> = self.input.chars().collect();
@@ -610,12 +609,12 @@ impl App {
             let split = Layout::vertical([
                 Constraint::Min(3),
                 Constraint::Length(1),
-                Constraint::Length(2),
+                Constraint::Length(3),
             ])
             .split(area);
             (Some(split[1]), split[0], split[2])
         } else {
-            let split = Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(area);
+            let split = Layout::vertical([Constraint::Min(2), Constraint::Length(3)]).split(area);
             (None, split[0], split[1])
         };
 
@@ -902,6 +901,18 @@ mod tests {
     }
 
     #[test]
+    fn quit_command_exits() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "/quit".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
+        }
+        assert!(app.handle_key(key(KeyCode::Enter), &tx, &cancel));
+    }
+
+    #[test]
     fn editing_moves_cursor_and_inserts() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -963,5 +974,33 @@ mod draw_tests {
             .join("\n");
         assert!(content.contains("first user message"), "{content}");
         assert!(content.contains("streaming answer"), "{content}");
+    }
+
+    #[test]
+    fn typed_input_is_visible_and_quit_exits_via_keys() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "hello world".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
+        }
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| app.draw(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let content: String = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("❯ hello world"), "{content}");
+        assert!(!app.handle_key(key(KeyCode::Enter), &tx, &cancel));
+        for c in "/quit".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
+        }
+        assert!(app.handle_key(key(KeyCode::Enter), &tx, &cancel));
     }
 }
