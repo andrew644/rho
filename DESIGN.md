@@ -99,9 +99,9 @@ loop:
 ## Implementation steps
 
 1. [x] `DESIGN.md`
-2. [ ] Scaffold Cargo project; dependencies compile
-3. [ ] `config` module + tests
-4. [ ] `client` module: SSE parsing, request building, delta/tool-call accumulation + tests
+2. [x] Scaffold Cargo project; dependencies compile
+3. [x] `config` module + tests
+4. [x] `client` module: SSE parsing, request building, delta/tool-call accumulation + tests
 5. [ ] `tools` module: read/write/edit/bash + tests
 6. [ ] `prompt` module: system prompt + AGENTS.md context + tests
 7. [ ] `agent` module: serial event loop, tool execution, events + tests
