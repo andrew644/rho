@@ -15,6 +15,11 @@ provider:
 model:
   id: qwen4exp
   max_tokens: 4096
+  # models: [other-model]     # extra ids selectable with /model
+# compaction:
+#   enabled: true
+#   reserve_tokens: 16384
+#   keep_recent_tokens: 20000
 # discord:
 #   enabled: true
 #   bot_token: "..."
@@ -33,10 +38,61 @@ cargo run
 ## Usage
 
 - Type a prompt and press Enter. The agent streams reasoning (∴), answers,
-  and tool activity (#).
+  and tool activity (#). The input border shows the model, estimated context
+  size, and current status.
 - Esc interrupts the current generation/loop. PgUp/PgDn scroll, Up/Down walk
   prompt history. Ctrl+C or `/quit` exits.
 - Tools: `read`, `bash`, `edit`, `write` (same semantics as pi).
+- `!cmd` runs a shell command and shares its output with the model;
+  `!!cmd` runs it without sharing.
+
+### Commands
+
+```
+/loop [forever|N|10m|until "cond"] <task>   agentic loop (rho-only feature)
+/compact [instructions]                     summarize old history to free context
+/new                                        start a new session
+/resume [n]                                 list recent sessions / open one
+/session                                    session file, id, message/token counts
+/name <text>                                name the current session
+/model [id]                                 list models / switch
+/stop  /help  /quit
+```
+
+Conversations are saved automatically as JSONL sessions under the state
+directory, grouped by working directory. Long conversations are compacted
+automatically when the context estimate nears `context_window`, or manually
+with `/compact`.
+
+### Prompt templates
+
+Markdown files in `~/.config/rho/prompts/*.md` or `<cwd>/.rho/prompts/*.md`
+become slash commands (filename = command name). Supported substitutions:
+`$1..$n`, `$@`/`$ARGUMENTS`, `${1:-default}`, `${@:-default}`, `${@:N}`,
+`${@:N:L}`; optional `description:` and `argument-hint:` frontmatter.
+
+```markdown
+---
+description: Review staged git changes
+argument-hint: "[focus]"
+---
+Review the staged changes. Focus on ${1:-correctness}.
+```
+
+### Print mode
+
+```sh
+rho --print "Summarize this repository"
+git diff | rho --print "Review this change"
+rho --print "@README.md what does this project do?"
+rho --continue --print "pick up where we left off"
+```
+
+`--print` runs one prompt, writes the final answer to stdout, and exits.
+`--continue` resumes the latest session for the directory, `--resume <path>`
+a specific one, `--model <id>` overrides the configured model. Piped stdin
+is prepended to the prompt and `@file` arguments are expanded into it. When
+stdout/stdin are redirected, print mode is the default.
 
 ### /loop
 

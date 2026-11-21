@@ -10,12 +10,15 @@ single YAML file.
 
 ```
 rho
-├── config      ~/.config/rho/config.yaml → Provider, Model, Loop, Discord settings
+├── config      ~/.config/rho/config.yaml → Provider, Model, Loop, Compaction, Discord settings
 ├── client      OpenAI-compatible chat-completions client (SSE streaming, tool calls, reasoning_content)
 ├── tools       read, bash, edit, write (same schemas/semantics as pi)
 ├── prompt      system prompt builder (preamble/tools/rules/docs/cwd sections + AGENTS.md project context)
 ├── agent       the agentic loop: user msg → stream → tool calls → results → repeat
-├── loop        /loop command: forever | N times | duration | until-condition prompt
+├── loops       /loop command: forever | N times | duration | until-condition prompt
+├── session     JSONL session persistence per working directory (/new /resume /session /name, --continue)
+├── compaction  token estimation + cut-point logic for /compact and auto-compaction
+├── templates   prompt templates: markdown files → slash commands with $1/$@ substitutions
 ├── discord     remote control via Discord (gateway websocket + REST send)
 └── tui         ratatui chat UI: transcript viewport, streaming status, input line, slash commands
 ```
@@ -25,9 +28,11 @@ rho
 - `agent::Agent` owns the conversation (`Vec<Message>`) and a `mpsc` event channel.
 - The TUI (and the Discord bridge) feed user prompts into the agent and render
   `AgentEvent`s: `AssistantTextDelta`, `ReasoningDelta`, `ToolStarted`,
-  `ToolFinished`, `TurnDone`, `LoopProgress`, `Error`.
+  `ToolFinished`, `TurnDone`, `LoopProgress`, `Info`, `ContextUsage`, `Error`.
 - Only one in-flight request to the model at a time (local server cannot
   handle concurrency), so the agent processes prompts from a queue serially.
+- After every command the agent persists the conversation to its session file
+  and emits `ContextUsage` (estimated tokens, message count) for the footer.
 
 ### Model API (openai-completions)
 
@@ -54,6 +59,39 @@ Built in pi's sectioned form: preamble ("You are a coding assistant running
 inside rho…"), `<tools>`, `<rules>`, `<project_context>` (contents of
 `AGENTS.md` in cwd, if present), `<cwd>`.
 
+### Sessions
+
+Every conversation is saved automatically as JSONL (`header` record +
+`message` records) under the OS state directory, grouped by working
+directory. `/new`, `/resume [n]`, `/session`, `/name`, and `rho --continue`
+manage sessions; resumed sessions rebuild the history under a freshly built
+system prompt for the current cwd.
+
+### Compaction
+
+Token usage is estimated at ~4 chars/token. When
+`est_tokens + reserve_tokens > context_window`, the agent compacts before
+the next model request: it walks back from the end to find a user-message
+cut point that keeps `keep_recent_tokens` of recent history, asks the model
+for a structured summary of everything before the cut, and rebuilds the
+history as system + summary + kept tail. `/compact [instructions]` runs the
+same flow manually; `!cmd` / `!!cmd` run shell commands with or without
+feeding the output to the model.
+
+### Prompt templates
+
+`~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` load as slash
+commands (filename = name). Arguments follow pi's shell-style quoting and
+substitute via `$1..$n`, `$@`/`$ARGUMENTS`, `${1:-default}`, `${@:-default}`,
+`${@:N}`, `${@:N:L}`.
+
+### CLI modes
+
+Interactive TUI by default; `--print` (or redirected stdin/stdout with a
+prompt) runs one prompt and prints the final answer. `--continue` /
+`--resume <path>` resume sessions, `--model <id>` overrides the model,
+`@file` arguments and piped stdin are folded into the prompt.
+
 ### Configuration — `~/.config/rho/config.yaml`
 
 ```yaml
@@ -63,7 +101,12 @@ provider:
 model:
   id: qwen4exp
   max_tokens: 4096
+  models: []            # extra ids selectable with /model
 context_window: 200000
+compaction:
+  enabled: true
+  reserve_tokens: 16384
+  keep_recent_tokens: 20000
 discord:
   enabled: false
   bot_token: ""
@@ -110,4 +153,4 @@ loop:
 10. [x] `discord` module: gateway client + bridge + tests for pure parts
 11. [x] End-to-end smoke test against the local server
 12. [x] Compare features in Pi and Rho and document what still needs to be implemented (see PARITY.md)
-13. [ ] Continue implementing features from Pi until parity is met (target defined in PARITY.md §2)
+13. [x] Continue implementing features from Pi until parity is met (sessions, compaction, prompt templates, shell escapes, print mode, /model — see PARITY.md §2)
