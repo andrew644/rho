@@ -97,7 +97,7 @@ async fn gateway_session(config: &Config, agent_tx: &mpsc::UnboundedSender<Agent
                 let frame = frame.ok_or_else(|| anyhow::anyhow!("gateway closed"))??;
                 let Message::Text(text) = frame else { continue };
                 let text = text.as_str();
-                let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                let Ok(value) = serde_json::from_str::<Value>(text) else { continue };
                 if let Some(s) = value["s"].as_u64() {
                     seq.store(s, Ordering::SeqCst);
                 }

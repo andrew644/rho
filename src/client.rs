@@ -12,8 +12,13 @@ use crate::types::{AssistantMessage, FunctionCall, Message, ToolCall, ToolSpec, 
 pub enum StreamEvent {
     TextDelta(String),
     ReasoningDelta(String),
-    ToolCallStarted { name: String },
-    Done { finish_reason: Option<String>, usage: Usage },
+    ToolCallStarted {
+        name: String,
+    },
+    Done {
+        finish_reason: Option<String>,
+        usage: Usage,
+    },
 }
 
 pub struct Client {
@@ -89,7 +94,12 @@ impl AssistantAccumulator {
                 self.content.push_str(c);
                 text.push(c.to_string());
             }
-            if let Some(r) = choice.delta.reasoning_content.as_deref().filter(|r| !r.is_empty()) {
+            if let Some(r) = choice
+                .delta
+                .reasoning_content
+                .as_deref()
+                .filter(|r| !r.is_empty())
+            {
                 self.reasoning.push_str(r);
                 reasoning.push(r.to_string());
             }
@@ -153,7 +163,8 @@ pub(crate) fn parse_sse_line(line: &str) -> Result<Option<Chunk>> {
     if data.is_empty() || data == "[DONE]" {
         return Ok(None);
     }
-    let chunk: Chunk = serde_json::from_str(data).with_context(|| format!("bad SSE data: {data}"))?;
+    let chunk: Chunk =
+        serde_json::from_str(data).with_context(|| format!("bad SSE data: {data}"))?;
     Ok(Some(chunk))
 }
 
@@ -208,7 +219,8 @@ impl Client {
 
         let mut acc = AssistantAccumulator::default();
         let mut buf = String::new();
-        let mut announced_tools: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut announced_tools: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
 
         while let Some(bytes) = resp.chunk().await? {
             if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
@@ -282,9 +294,11 @@ mod tests {
 
     #[test]
     fn parses_data_line() {
-        let c = parse_sse_line(r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#)
-            .unwrap()
-            .unwrap();
+        let c = parse_sse_line(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(c.choices[0].delta.content.as_deref(), Some("hi"));
     }
 

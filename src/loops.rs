@@ -59,7 +59,10 @@ fn parse_duration(token: &str) -> Option<Duration> {
 pub fn parse_loop_spec(input: &str) -> Result<LoopSpec, String> {
     let input = input.trim();
     if input.is_empty() {
-        return Err("usage: /loop [forever | <n> | <duration e.g. 10m> | until \"<condition>\"] <task>".to_string());
+        return Err(
+            "usage: /loop [forever | <n> | <duration e.g. 10m> | until \"<condition>\"] <task>"
+                .to_string(),
+        );
     }
     let (mode_token, rest) = input
         .split_once(char::is_whitespace)
@@ -81,7 +84,10 @@ pub fn parse_loop_spec(input: &str) -> Result<LoopSpec, String> {
         if prompt.is_empty() {
             return Err("missing task prompt after condition".to_string());
         }
-        return Ok(LoopSpec { mode: LoopMode::Until { condition }, prompt });
+        return Ok(LoopSpec {
+            mode: LoopMode::Until { condition },
+            prompt,
+        });
     }
 
     let mode = if mode_token == "forever" || mode_token == "inf" {
@@ -100,7 +106,10 @@ pub fn parse_loop_spec(input: &str) -> Result<LoopSpec, String> {
     if rest.is_empty() {
         return Err("missing task prompt".to_string());
     }
-    Ok(LoopSpec { mode, prompt: rest.to_string() })
+    Ok(LoopSpec {
+        mode,
+        prompt: rest.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -111,11 +120,17 @@ mod tests {
     fn parses_forever_and_count() {
         assert_eq!(
             parse_loop_spec("forever run tests").unwrap(),
-            LoopSpec { mode: LoopMode::Forever, prompt: "run tests".into() }
+            LoopSpec {
+                mode: LoopMode::Forever,
+                prompt: "run tests".into()
+            }
         );
         assert_eq!(
             parse_loop_spec("5   do the thing ").unwrap(),
-            LoopSpec { mode: LoopMode::Count(5), prompt: "do the thing".into() }
+            LoopSpec {
+                mode: LoopMode::Count(5),
+                prompt: "do the thing".into()
+            }
         );
         assert!(parse_loop_spec("0 task").is_err());
         assert!(parse_loop_spec("forever").is_err());
@@ -138,7 +153,9 @@ mod tests {
         let spec = parse_loop_spec("until \"are all tests green?\" keep fixing failures").unwrap();
         assert_eq!(
             spec.mode,
-            LoopMode::Until { condition: "are all tests green?".into() }
+            LoopMode::Until {
+                condition: "are all tests green?".into()
+            }
         );
         assert_eq!(spec.prompt, "keep fixing failures");
         assert!(parse_loop_spec("until no quotes here").is_err());

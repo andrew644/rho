@@ -15,6 +15,8 @@ pub struct ModelConfig {
     pub id: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -45,7 +47,41 @@ fn default_max_turns() -> usize {
 
 impl Default for LoopConfig {
     fn default() -> Self {
-        Self { max_turns_per_run: default_max_turns() }
+        Self {
+            max_turns_per_run: default_max_turns(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CompactionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_reserve_tokens")]
+    pub reserve_tokens: usize,
+    #[serde(default = "default_keep_recent_tokens")]
+    pub keep_recent_tokens: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reserve_tokens() -> usize {
+    crate::compaction::RESERVE_TOKENS
+}
+
+fn default_keep_recent_tokens() -> usize {
+    crate::compaction::KEEP_RECENT_TOKENS
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reserve_tokens: default_reserve_tokens(),
+            keep_recent_tokens: default_keep_recent_tokens(),
+        }
     }
 }
 
@@ -59,6 +95,8 @@ pub struct Config {
     pub discord: DiscordConfig,
     #[serde(default)]
     pub loop_config: LoopConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 fn default_context_window() -> u32 {
@@ -109,6 +147,10 @@ discord:
   allowed_user_id: "456"
 loop_config:
   max_turns_per_run: 10
+compaction:
+  enabled: false
+  reserve_tokens: 8192
+  keep_recent_tokens: 4096
 "#;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -122,6 +164,9 @@ loop_config:
         assert!(cfg.discord.enabled);
         assert_eq!(cfg.discord.channel_id, "123");
         assert_eq!(cfg.loop_config.max_turns_per_run, 10);
+        assert!(!cfg.compaction.enabled);
+        assert_eq!(cfg.compaction.reserve_tokens, 8192);
+        assert_eq!(cfg.compaction.keep_recent_tokens, 4096);
     }
 
     #[test]
@@ -140,6 +185,10 @@ model:
         assert_eq!(cfg.context_window, 200000);
         assert!(!cfg.discord.enabled);
         assert_eq!(cfg.loop_config.max_turns_per_run, 64);
+        assert!(cfg.compaction.enabled);
+        assert_eq!(cfg.compaction.reserve_tokens, 16_384);
+        assert_eq!(cfg.compaction.keep_recent_tokens, 20_000);
+        assert!(cfg.model.models.is_empty());
     }
 
     #[test]

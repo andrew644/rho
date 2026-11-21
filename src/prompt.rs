@@ -39,9 +39,7 @@ pub fn build_system_prompt(cwd: &Path) -> String {
         .map(|(name, snippet)| format!("- {name}: {snippet}"))
         .collect::<Vec<_>>()
         .join("\n");
-    sections.push(format!(
-        "<tools>\n{tools_list}\n</tools>"
-    ));
+    sections.push(format!("<tools>\n{tools_list}\n</tools>"));
 
     let rules = [
         "Use bash for file operations like ls, rg, find",
@@ -65,7 +63,11 @@ pub fn build_system_prompt(cwd: &Path) -> String {
     if !context_files.is_empty() {
         let rendered = context_files
             .iter()
-            .map(|(path, content)| format!("<project_instructions path=\"{path}\">\n{content}\n</project_instructions>"))
+            .map(|(path, content)| {
+                format!(
+                    "<project_instructions path=\"{path}\">\n{content}\n</project_instructions>"
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
         sections.push(format!(

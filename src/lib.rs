@@ -1,9 +1,12 @@
 pub mod agent;
 pub mod client;
+pub mod compaction;
 pub mod config;
 pub mod discord;
 pub mod loops;
 pub mod prompt;
+pub mod session;
+pub mod templates;
 pub mod tools;
 pub mod tui;
 pub mod types;

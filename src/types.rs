@@ -51,7 +51,7 @@ impl Message {
         }
     }
 
-    fn with_content(role: &str, content: impl Into<String>) -> Self {
+    pub fn with_content(role: &str, content: impl Into<String>) -> Self {
         Self {
             role: role.to_string(),
             content: Some(content.into()),

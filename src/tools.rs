@@ -16,11 +16,17 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(output: impl Into<String>) -> Self {
-        Self { output: output.into(), is_error: false }
+        Self {
+            output: output.into(),
+            is_error: false,
+        }
     }
 
     pub fn err(output: impl Into<String>) -> Self {
-        Self { output: output.into(), is_error: true }
+        Self {
+            output: output.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -53,6 +59,13 @@ pub fn all_tools(cwd: PathBuf) -> Vec<Box<dyn Tool>> {
 
 pub fn tool_names() -> Vec<&'static str> {
     vec!["read", "bash", "edit", "write"]
+}
+
+pub fn run_bash(cwd: &Path, command: &str, timeout: Option<u64>) -> ToolResult {
+    BashTool {
+        cwd: cwd.to_path_buf(),
+    }
+    .run(command, timeout)
 }
 
 fn resolve(cwd: &Path, path: &str) -> PathBuf {
@@ -104,7 +117,11 @@ impl Tool for ReadTool {
             Ok(c) => c,
             Err(e) => return ToolResult::err(format!("failed to read {}: {e}", path.display())),
         };
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -193,7 +210,11 @@ impl BashTool {
                 combined
             })
         } else {
-            let code = output.status.code().map(|c| c.to_string()).unwrap_or_default();
+            let code = output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_default();
             ToolResult::err(format!("{combined}\nExit code: {code}"))
         }
     }
@@ -307,10 +328,16 @@ impl Tool for EditTool {
             };
             let count = content.matches(old).count();
             if count == 0 {
-                return ToolResult::err(format!("oldText not found in {}: {old:?}", path.display()));
+                return ToolResult::err(format!(
+                    "oldText not found in {}: {old:?}",
+                    path.display()
+                ));
             }
             if count > 1 {
-                return ToolResult::err(format!("oldText is not unique ({count} matches) in {}", path.display()));
+                return ToolResult::err(format!(
+                    "oldText is not unique ({count} matches) in {}",
+                    path.display()
+                ));
             }
             let start = content.find(old).unwrap();
             matches.push((start, start + old.len(), old));
@@ -382,7 +409,11 @@ impl Tool for WriteTool {
             }
         }
         match std::fs::write(&path, content) {
-            Ok(()) => ToolResult::ok(format!("Wrote {} bytes to {}", content.len(), path.display())),
+            Ok(()) => ToolResult::ok(format!(
+                "Wrote {} bytes to {}",
+                content.len(),
+                path.display()
+            )),
             Err(e) => ToolResult::err(format!("failed to write {}: {e}", path.display())),
         }
     }
