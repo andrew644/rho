@@ -103,9 +103,9 @@ loop:
 3. [x] `config` module + tests
 4. [x] `client` module: SSE parsing, request building, delta/tool-call accumulation + tests
 5. [x] `tools` module: read/write/edit/bash + tests
-6. [ ] `prompt` module: system prompt + AGENTS.md context + tests
-7. [ ] `agent` module: serial event loop, tool execution, events + tests
-8. [ ] `loop` module: loop specs/parsing/condition check + tests
+6. [x] `prompt` module: system prompt + AGENTS.md context + tests
+7. [x] `agent` module: serial event loop, tool execution, events + tests
+8. [x] `loop` module: loop specs/parsing/condition check + tests
 9. [ ] `tui` module: ratatui app, slash commands incl. /loop, integrate agent
 10. [ ] `discord` module: gateway client + bridge + tests for pure parts
 11. [ ] End-to-end smoke test against the local server; final commit
