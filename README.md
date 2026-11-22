@@ -17,6 +17,7 @@ model:
   max_tokens: 4096
   # models: [other-model]     # extra ids selectable with /model
 # theme: light              # dark | light | ansi
+# clipboard: auto           # auto | terminal | system (how copies reach the clipboard)
 # compaction:
 #   enabled: true
 #   reserve_tokens: 16384
@@ -48,6 +49,14 @@ cargo run
 - Esc interrupts the current generation/loop. The mouse wheel, PgUp/PgDn, and
   Home/End scroll the transcript (a scrollbar shows the viewport). Up/Down walk
   prompt history. Ctrl+C or `/quit` exits.
+- Drag with the mouse to select transcript text; releasing copies it and the
+  footer says where it went (`copied 132 characters to terminal`). Double-click
+  selects a word, triple-click selects the row, Ctrl+Y re-copies the current
+  selection, and Esc clears the highlight. Selection is limited to the visible
+  rows and copies what is on screen (wrapped lines and indented tool output
+  included). Scrolling or streaming keeps the highlight on the same text.
+  Paste with the terminal's usual paste (bracketed paste is enabled, so
+  multi-line pastes land in the input without submitting).
 - Ctrl+R toggles the reasoning block. Tab / Shift-Tab complete slash commands
   and template names; after `/pwd ` they also complete directory paths
   (bash-style: unique matches complete and descend, ambiguous matches cycle;
@@ -58,6 +67,18 @@ cargo run
 - `!cmd` runs a shell command and shares its output with the model;
   `!!cmd` runs it without sharing. `/pwd <path>` changes the working
   directory for tools, agent requests, and `!`/`!!` commands.
+
+### Clipboard
+
+Copies are sent to the terminal emulator with the OSC 52 escape sequence, so
+they work over ssh and inside tmux (tmux needs `set -g set-clipboard on`), and
+no clipboard program has to be installed. If a desktop clipboard helper is
+reachable (`wl-copy`, `xclip`, `xsel`, or `pbcopy`, with `WAYLAND_DISPLAY` /
+`DISPLAY` set), rho pipes the text into it instead, since that also works in
+terminals that ignore OSC 52. Force one path with `clipboard: terminal` or
+`clipboard: system` in config.yaml. Terminal-side selection still works in most
+emulators if you hold Shift while dragging (that path bypasses rho's mouse
+handling).
 
 ### Commands
 

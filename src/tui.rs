@@ -13,12 +13,14 @@ use ratatui::Frame;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{AgentCommand, AgentEvent};
+use crate::clipboard::{Clipboard, ClipboardMode};
 use crate::config::ThemeName;
 use crate::loops::parse_loop_spec;
+use crate::selection::{self, Anchor, Selection};
 use crate::session::{self, SessionInfo};
 use crate::templates::{self, Template};
 
@@ -255,6 +257,14 @@ fn assistant_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const INPUT_INDENT: usize = 2;
+
+/// Clicks this close together at the same cell are counted as a double/triple click.
+const CLICK_CHAIN: Duration = Duration::from_millis(400);
+
+/// How long the footer keeps showing the result of the last copy.
+const NOTICE_TTL: Duration = Duration::from_secs(4);
+
+const SELECTION_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 #[derive(Debug)]
 struct InputRow {
@@ -494,6 +504,7 @@ pub struct App {
     quit: bool,
     follow: bool,
     last_rendered_lines: usize,
+    last_scroll: usize,
     pwd: PathBuf,
     model: String,
     theme: Theme,
@@ -505,6 +516,14 @@ pub struct App {
     message_count: usize,
     session_path: Option<String>,
     session_name: Option<String>,
+    selection: Option<Selection>,
+    selecting: bool,
+    clicks: u32,
+    last_click: Option<(Instant, u16, u16)>,
+    screen: Vec<Vec<char>>,
+    text_area: Rect,
+    clipboard: Clipboard,
+    notice: Option<(String, Instant)>,
 }
 
 impl App {
@@ -518,7 +537,7 @@ impl App {
         session_path: Option<String>,
     ) -> Self {
         let welcome = format!(
-            "rho v{} · model {model} · context {} tokens\npwd {}\nsession {}\n/help for commands · Esc interrupts · Ctrl+R toggles reasoning · Ctrl+O expands tool output",
+            "rho v{} · model {model} · context {} tokens\npwd {}\nsession {}\n/help for commands · Esc interrupts · Ctrl+R toggles reasoning · Ctrl+O expands tool output · drag to select and copy",
             env!("CARGO_PKG_VERSION"),
             fmt_tokens(context_window as usize),
             pwd.display(),
@@ -549,6 +568,7 @@ impl App {
             quit: false,
             follow: true,
             last_rendered_lines: 0,
+            last_scroll: 0,
             pwd,
             model,
             theme,
@@ -560,6 +580,14 @@ impl App {
             message_count: 0,
             session_path: None,
             session_name: None,
+            selection: None,
+            selecting: false,
+            clicks: 0,
+            last_click: None,
+            screen: Vec::new(),
+            text_area: Rect::ZERO,
+            clipboard: Clipboard::new(ClipboardMode::default()),
+            notice: None,
         }
     }
 
@@ -823,16 +851,19 @@ impl App {
                 false
             }
             KeyCode::Esc => {
+                self.clear_selection();
                 cancel.store(true, Ordering::SeqCst);
                 self.push("interrupt requested", Kind::Info);
                 false
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.expand_tools = !self.expand_tools;
+                self.clear_selection();
                 false
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.show_reasoning = !self.show_reasoning;
+                self.clear_selection();
                 self.push(
                     if self.show_reasoning {
                         "reasoning shown"
@@ -841,6 +872,10 @@ impl App {
                     },
                     Kind::Info,
                 );
+                false
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.copy_selection();
                 false
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
@@ -1015,6 +1050,165 @@ impl App {
         }
     }
 
+    /// Keep a selection on the text it was made over while the view moves.
+    fn follow_selection(&mut self, delta: i32) {
+        if delta == 0 || self.selection.is_none() {
+            return;
+        }
+        let (_, _, top, bottom) = self.select_bounds();
+        if let Some(selection) = &mut self.selection {
+            selection.shift_rows(delta, top, bottom);
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selecting = false;
+    }
+
+    /// First/last selectable column and top/bottom row of the transcript.
+    fn select_bounds(&self) -> (u16, u16, u16, u16) {
+        let area = self.text_area;
+        (
+            area.left(),
+            area.right().saturating_sub(1),
+            area.top(),
+            area.bottom().saturating_sub(1),
+        )
+    }
+
+    pub fn on_mouse(&mut self, mouse: event::MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_by(3),
+            MouseEventKind::ScrollDown => self.scroll_by(-3),
+            MouseEventKind::Down(_) => self.press(mouse.column, mouse.row),
+            MouseEventKind::Drag(_) => self.drag(mouse.column, mouse.row),
+            MouseEventKind::Up(_) => self.release(mouse.column, mouse.row),
+            _ => {}
+        }
+    }
+
+    fn inside_text(&self, col: u16, row: u16) -> bool {
+        let (first_col, last_col, top, bottom) = self.select_bounds();
+        (first_col..=last_col).contains(&col) && (top..=bottom).contains(&row)
+    }
+
+    fn press(&mut self, col: u16, row: u16) {
+        if self.screen.is_empty() || !self.inside_text(col, row) {
+            return;
+        }
+        let (first_col, last_col, _, _) = self.select_bounds();
+        let clicks = self.count_clicks(col, row);
+        let anchored = Selection::point(Anchor::new(col, row), first_col, last_col);
+        let range = match clicks {
+            1 => None,
+            2 => selection::word_at(&self.screen, row as usize, col as usize),
+            _ => selection::line_at(
+                &self.screen,
+                row as usize,
+                first_col as usize,
+                last_col as usize,
+            ),
+        };
+        self.selection = Some(match range {
+            Some((lo, hi)) => Selection::new(
+                Anchor::new(lo as u16, row),
+                Anchor::new(hi as u16, row),
+                first_col,
+                last_col,
+            ),
+            None => anchored,
+        });
+        self.selecting = true;
+    }
+
+    fn drag(&mut self, col: u16, row: u16) {
+        if !self.selecting || self.selection.is_none() {
+            return;
+        }
+        let (first_col, last_col, top, bottom) = self.select_bounds();
+        if last_col < first_col || bottom < top {
+            return;
+        }
+        let end = Anchor::new(col.clamp(first_col, last_col), row.clamp(top, bottom));
+        if let Some(selection) = &mut self.selection {
+            selection.end = end;
+        }
+    }
+
+    fn release(&mut self, col: u16, row: u16) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        self.drag(col, row);
+        let Some(selection) = self.selection else {
+            return;
+        };
+        if self.clicks == 1 && selection.is_point() {
+            self.selection = None;
+            return;
+        }
+        self.copy_selection();
+    }
+
+    fn count_clicks(&mut self, col: u16, row: u16) -> u32 {
+        let repeated = self.last_click.is_some_and(|(at, c, r)| {
+            at.elapsed() < CLICK_CHAIN && r == row && (c as i32 - col as i32).abs() <= 1
+        });
+        self.clicks = if repeated { self.clicks + 1 } else { 1 };
+        self.last_click = Some((Instant::now(), col, row));
+        self.clicks
+    }
+
+    pub fn copy_selection(&mut self) {
+        let Some(selection) = self.selection else {
+            self.set_notice("nothing selected — drag to select");
+            return;
+        };
+        let text = selection::extract(&self.screen, &selection);
+        if text.is_empty() {
+            self.selection = None;
+            self.set_notice("nothing selected — drag to select");
+            return;
+        };
+        match self.clipboard.put(&text) {
+            Ok(placement) => self.set_notice(format!(
+                "copied {} characters to {}",
+                text.chars().count(),
+                placement.label()
+            )),
+            Err(e) => self.set_notice(format!("copy failed: {e}")),
+        }
+    }
+
+    fn set_notice(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now()));
+    }
+
+    fn notice_text(&self) -> Option<&str> {
+        let (text, at) = self.notice.as_ref()?;
+        (at.elapsed() < NOTICE_TTL).then_some(text.as_str())
+    }
+
+    fn paint_selection(&self, frame: &mut Frame) {
+        let Some(selection) = &self.selection else {
+            return;
+        };
+        let buffer = frame.buffer_mut();
+        let area = buffer.area;
+        for row in area.top()..area.bottom() {
+            let Some((lo, hi)) = selection.row_range(row) else {
+                continue;
+            };
+            let lo = lo.max(area.left());
+            let hi = hi.min(area.right().saturating_sub(1));
+            for col in lo..=hi {
+                buffer[(col, row)].set_style(SELECTION_STYLE);
+            }
+        }
+    }
+
     fn update_status(&mut self) {
         if !self.busy {
             self.turn_start = None;
@@ -1103,6 +1297,7 @@ impl App {
             Kind::Info,
         );
         self.push("!cmd runs a shell command and shares its output with the model; !!cmd runs it without sharing", Kind::Info);
+        self.push("drag selects transcript text and copies it to the clipboard; double-click selects a word, triple-click a line, Ctrl+Y copies the selection again, Esc clears it", Kind::Info);
         let help = templates::render_help(&self.templates);
         if !help.is_empty() {
             self.push("prompt templates:", Kind::Info);
@@ -1167,6 +1362,7 @@ impl App {
             Some(InputAction::Command(Command::New)) => {
                 let _ = agent.send(AgentCommand::NewSession);
                 self.entries.clear();
+                self.clear_selection();
                 self.pending = None;
                 self.push("new session started", Kind::Info);
             }
@@ -1189,6 +1385,7 @@ impl App {
                             let path = self.session_list[n - 1].path.clone();
                             let _ = agent.send(AgentCommand::Resume { path });
                             self.entries.clear();
+                            self.clear_selection();
                             self.push(format!("resumed session {}", n), Kind::Info);
                         }
                         _ => self.push("usage: /resume to list, /resume <n> to open", Kind::Error),
@@ -1285,6 +1482,7 @@ impl App {
             Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).split(chunks.1);
         let text_area = text_chunks[0];
         let scrollbar_area = text_chunks[1];
+        self.text_area = text_area;
         let width = text_area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
         let mut prev_kind: Option<Kind> = None;
@@ -1305,14 +1503,17 @@ impl App {
             append(pending, &mut lines);
         }
         let new_lines = lines.len().saturating_sub(self.last_rendered_lines);
+        let visible = text_area.height as usize;
         if !self.follow && new_lines > 0 {
             self.scroll_from_bottom += new_lines;
         }
         self.last_rendered_lines = lines.len();
-        let visible = text_area.height as usize;
         let scroll = lines
             .len()
             .saturating_sub(visible + self.scroll_from_bottom);
+        // Rows the text moved down by, so an open selection stays on its text.
+        self.follow_selection(self.last_scroll as i32 - scroll as i32);
+        self.last_scroll = scroll;
         let paragraph = Paragraph::new(lines).scroll((scroll as u16, 0));
         frame.render_widget(paragraph, text_area);
         if visible > 0 && self.last_rendered_lines > visible {
@@ -1344,6 +1545,12 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ));
         }
+        if let Some(notice) = self.notice_text() {
+            title.push_span(Span::styled(
+                format!("· {notice} "),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         let border_style = if self.busy {
             Style::default().fg(self.theme.busy_border_color())
         } else {
@@ -1363,6 +1570,8 @@ impl App {
                 .saturating_add(INPUT_INDENT as u16 + prompt.cursor_col as u16),
             inner.y.saturating_add(prompt.cursor_row as u16),
         ));
+        self.paint_selection(frame);
+        self.screen = selection::screen_from_buffer(frame.buffer_mut());
     }
 
     pub fn should_quit(&self) -> bool {
@@ -1396,6 +1605,7 @@ pub struct TuiOptions {
     pub context_window: u32,
     pub theme: ThemeName,
     pub session_path: Option<String>,
+    pub clipboard: ClipboardMode,
 }
 
 async fn run_inner(
@@ -1414,6 +1624,7 @@ async fn run_inner(
         Theme::new(opts.theme),
         opts.session_path,
     );
+    app.clipboard = Clipboard::new(opts.clipboard);
     let mut keys = crossterm::event::EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
     loop {
@@ -1433,11 +1644,7 @@ async fn run_inner(
                             break;
                         }
                     }
-                    Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_by(3),
-                        MouseEventKind::ScrollDown => app.scroll_by(-3),
-                        _ => {}
-                    },
+                    Some(Ok(Event::Mouse(mouse))) => app.on_mouse(mouse),
                     Some(Ok(Event::Paste(text))) => app.insert_text(&text),
                     _ => {}
                 }
@@ -2581,5 +2788,295 @@ mod scroll_tests {
         assert!(render(&mut app, 80, 24)
             .iter()
             .any(|l| l.contains("because reasons")));
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crossterm::event::MouseButton;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    fn test_app() -> App {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
+        app.clipboard = Clipboard::memory();
+        app
+    }
+
+    fn draw(app: &mut App, w: u16, h: u16) -> Buffer {
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f, f.area())).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn pointer(kind: MouseEventKind, column: u16, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn down(column: u16, row: u16) -> event::MouseEvent {
+        pointer(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    fn drag_to(column: u16, row: u16) -> event::MouseEvent {
+        pointer(MouseEventKind::Drag(MouseButton::Left), column, row)
+    }
+
+    fn release(column: u16, row: u16) -> event::MouseEvent {
+        pointer(MouseEventKind::Up(MouseButton::Left), column, row)
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        app.on_mouse(down(column, row));
+        app.on_mouse(release(column, row));
+    }
+
+    fn cells(row: &str, from: usize, to: usize) -> String {
+        row.chars()
+            .skip(from)
+            .take(to - from + 1)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn inverted(buffer: &Buffer, x: u16, y: u16) -> bool {
+        buffer[(x, y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    }
+
+    fn filled_app() -> App {
+        let mut app = test_app();
+        for i in 0..40 {
+            // Assistant entries render as consecutive rows with no blank separators.
+            app.push(format!("line {i}"), Kind::Assistant);
+        }
+        app
+    }
+
+    #[test]
+    fn dragging_selects_and_copies_the_visible_block() {
+        let mut app = filled_app();
+        let buffer = draw(&mut app, 80, 24);
+        let text = rows(&buffer);
+        let area = app.text_area;
+        let (top, mid, bottom) = (area.top() + 1, area.top() + 2, area.top() + 3);
+
+        app.on_mouse(down(area.left() + 2, top));
+        app.on_mouse(drag_to(area.left() + 6, bottom));
+        app.on_mouse(release(area.left() + 6, bottom));
+
+        let copied: Vec<&str> = app.clipboard.last().unwrap().lines().collect();
+        assert_eq!(copied.len(), 3);
+        assert_eq!(copied[0], cells(&text[top as usize], 2, 6));
+        assert_eq!(copied[1], cells(&text[mid as usize], 0, 78));
+        assert_eq!(copied[2], cells(&text[bottom as usize], 0, 6));
+        assert!(!copied[1].is_empty(), "middle row should carry text");
+    }
+
+    #[test]
+    fn selection_is_highlighted_and_reported_in_the_footer() {
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        let area = app.text_area;
+        app.on_mouse(down(area.left() + 2, area.top() + 1));
+        app.on_mouse(drag_to(area.left() + 6, area.top() + 3));
+        app.on_mouse(release(area.left() + 6, area.top() + 3));
+
+        let buffer = draw(&mut app, 80, 24);
+        assert!(inverted(&buffer, area.left() + 3, area.top() + 1));
+        assert!(inverted(&buffer, area.left() + 30, area.top() + 2));
+        assert!(inverted(&buffer, area.left() + 3, area.top() + 3));
+        assert!(!inverted(&buffer, area.left(), area.top() + 1));
+        assert!(!inverted(&buffer, area.left() + 30, area.top() + 3));
+        assert!(!inverted(&buffer, area.left() + 3, area.top()));
+        assert!(!inverted(&buffer, area.left() + 3, area.top() + 4));
+        let footer = rows(&buffer).join("\n");
+        let expected = format!(
+            "copied {} characters",
+            app.clipboard.last().unwrap().chars().count()
+        );
+        assert!(footer.contains(&expected), "{footer}");
+    }
+
+    #[test]
+    fn plain_click_copies_nothing_and_clears_the_selection() {
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        let area = app.text_area;
+        app.on_mouse(down(area.left() + 2, area.top() + 1));
+        app.on_mouse(drag_to(area.left() + 9, area.top() + 2));
+        app.on_mouse(release(area.left() + 9, area.top() + 2));
+        assert_eq!(app.clipboard.history().len(), 1);
+        assert!(app.selection.is_some());
+
+        click(&mut app, area.left() + 40, area.top() + 5);
+        assert_eq!(app.clipboard.history().len(), 1);
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_cursor() {
+        let mut app = test_app();
+        app.push("alpha beta", Kind::Tool);
+        let buffer = draw(&mut app, 80, 24);
+        let row = rows(&buffer)
+            .iter()
+            .position(|line| line.contains("# alpha beta"))
+            .unwrap() as u16;
+
+        click(&mut app, 4, row);
+        assert!(app.clipboard.history().is_empty(), "single click copies");
+        click(&mut app, 4, row);
+        assert_eq!(app.clipboard.last(), Some("alpha"));
+    }
+
+    #[test]
+    fn triple_click_selects_the_whole_row() {
+        let mut app = test_app();
+        app.push("alpha beta", Kind::Tool);
+        let buffer = draw(&mut app, 80, 24);
+        let row = rows(&buffer)
+            .iter()
+            .position(|line| line.contains("# alpha beta"))
+            .unwrap() as u16;
+
+        click(&mut app, 4, row);
+        click(&mut app, 4, row);
+        click(&mut app, 4, row);
+        assert_eq!(app.clipboard.last(), Some("# alpha beta"));
+    }
+
+    #[test]
+    fn ctrl_y_copies_the_selection_again() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        let area = app.text_area;
+        app.on_mouse(down(area.left(), area.top() + 1));
+        app.on_mouse(drag_to(area.left() + 4, area.top() + 1));
+        app.on_mouse(release(area.left() + 4, area.top() + 1));
+        let once = app.clipboard.last().unwrap().to_string();
+        assert!(!once.is_empty());
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &tx,
+            &cancel,
+        );
+        assert_eq!(app.clipboard.history().len(), 2);
+        assert_eq!(app.clipboard.history()[1], once);
+    }
+
+    #[test]
+    fn ctrl_y_without_a_selection_says_so() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &tx,
+            &cancel,
+        );
+        assert!(app.clipboard.history().is_empty());
+        let buffer = draw(&mut app, 80, 24);
+        assert!(rows(&buffer).join("\n").contains("nothing selected"));
+    }
+
+    #[test]
+    fn scrolling_keeps_the_selection_on_the_same_text() {
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        let area = app.text_area;
+        app.on_mouse(down(area.left(), area.top() + 1));
+        app.on_mouse(drag_to(area.left() + 20, area.top() + 3));
+        app.on_mouse(release(area.left() + 20, area.top() + 3));
+        let before = app.clipboard.last().unwrap().to_string();
+        let rows_before = app.selection.unwrap().start.row;
+
+        app.scroll_by(3);
+        draw(&mut app, 80, 24);
+        assert_eq!(app.selection.unwrap().start.row, rows_before + 3);
+        app.copy_selection();
+        assert_eq!(app.clipboard.history().last(), Some(&before));
+    }
+
+    #[test]
+    fn streaming_keeps_the_selection_on_the_same_text() {
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        let area = app.text_area;
+        app.on_mouse(down(area.left(), area.top() + 2));
+        app.on_mouse(drag_to(area.left() + 12, area.top() + 4));
+        app.on_mouse(release(area.left() + 12, area.top() + 4));
+        let before = app.clipboard.last().unwrap().to_string();
+        assert!(!before.is_empty());
+
+        app.scroll_by(4);
+        app.on_event(AgentEvent::TextDelta(
+            "streamed answer that spans several wrapped lines of text".into(),
+        ));
+        draw(&mut app, 80, 24);
+        app.copy_selection();
+        assert_eq!(app.clipboard.history().last(), Some(&before));
+    }
+
+    #[test]
+    fn esc_clears_the_selection() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        let area = app.text_area;
+        app.on_mouse(down(area.left(), area.top() + 1));
+        app.on_mouse(drag_to(area.left() + 8, area.top() + 2));
+        app.on_mouse(release(area.left() + 8, area.top() + 2));
+        assert!(app.selection.is_some());
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn clicks_outside_the_transcript_do_not_select() {
+        let mut app = filled_app();
+        draw(&mut app, 80, 24);
+        let below = app.text_area.bottom();
+        app.on_mouse(down(4, below));
+        app.on_mouse(drag_to(30, below));
+        app.on_mouse(release(30, below));
+        assert!(app.selection.is_none());
+        assert!(app.clipboard.history().is_empty());
     }
 }

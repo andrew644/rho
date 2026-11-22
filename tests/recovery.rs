@@ -76,6 +76,7 @@ fn config(base_url: String) -> Config {
         },
         context_window: 200_000,
         theme: ThemeName::Dark,
+        clipboard: Default::default(),
         discord: DiscordConfig::default(),
         loop_config: LoopConfig::default(),
         compaction: CompactionConfig::default(),

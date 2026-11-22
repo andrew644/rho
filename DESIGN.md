@@ -118,6 +118,23 @@ commands (filename = name). Arguments follow pi's shell-style quoting and
 substitute via `$1..$n`, `$@`/`$ARGUMENTS`, `${1:-default}`, `${@:-default}`,
 `${@:N}`, `${@:N:L}`.
 
+### Selection and clipboard
+
+The TUI captures the mouse (wheel scrolling), so rho implements selection
+itself: mouse down/drag/up over the transcript defines a cell rectangle, the
+cells are painted reverse-video, and the text is read back out of the rendered
+screen snapshot rather than the entry model — so wrapped lines, hanging
+indents and code blocks copy exactly as displayed (`selection` module).
+Double-click selects the word, triple-click the row. The screen snapshot also
+keeps wide glyphs aligned to their two cells.
+
+Copying is terminal-first (`clipboard` module): an OSC 52 sequence asks the
+terminal emulator to hold the text, which works over ssh and needs no helper
+binary; when a desktop helper (`wl-copy`/`xclip`/`xsel`/`pbcopy`) is reachable
+in a real display session it is used instead. `clipboard: auto | terminal |
+system` forces the path. Nothing is spawned and no terminal write happens
+before a copy is requested.
+
 ### CLI modes
 
 Interactive TUI by default; `--print` (or redirected stdin/stdout with a
@@ -137,6 +154,7 @@ model:
   models: []            # extra ids selectable with /model
 context_window: 200000
 theme: dark             # dark | light | ansi
+clipboard: auto         # auto | terminal | system
 compaction:
   enabled: true
   reserve_tokens: 16384
@@ -233,3 +251,7 @@ Improvements identified from a hands-on review of the running TUI.
 12. [x] **Rich welcome screen** — first frame should show version, model,
     context window, cwd, and session file so config can be verified before the
     first prompt.
+13. [x] **Select and copy** — mouse capture disabled the terminal's own
+    drag-to-select; implement selection in the transcript (drag for a block,
+    double-click for a word, triple-click for a row, Ctrl+Y to copy again) and
+    put the text on the clipboard via OSC 52 with a helper-program fallback.

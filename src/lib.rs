@@ -1,11 +1,13 @@
 pub mod agent;
 pub mod client;
+pub mod clipboard;
 pub mod compaction;
 pub mod config;
 pub mod discord;
 pub mod history;
 pub mod loops;
 pub mod prompt;
+pub mod selection;
 pub mod session;
 pub mod templates;
 pub mod tools;

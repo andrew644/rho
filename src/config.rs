@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::clipboard::ClipboardMode;
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     pub base_url: String,
@@ -103,6 +105,8 @@ pub struct Config {
     #[serde(default)]
     pub theme: ThemeName,
     #[serde(default)]
+    pub clipboard: ClipboardMode,
+    #[serde(default)]
     pub discord: DiscordConfig,
     #[serde(default)]
     pub loop_config: LoopConfig,
@@ -202,6 +206,7 @@ model:
         assert_eq!(cfg.compaction.reserve_tokens, 16_384);
         assert_eq!(cfg.compaction.keep_recent_tokens, 20_000);
         assert!(cfg.model.models.is_empty());
+        assert_eq!(cfg.clipboard, ClipboardMode::Auto);
     }
 
     #[test]
@@ -218,6 +223,22 @@ theme: light
         std::fs::write(&path, yaml).unwrap();
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.theme, ThemeName::Light);
+    }
+
+    #[test]
+    fn parses_clipboard_mode() {
+        let yaml = r#"
+provider:
+  base_url: http://localhost:8000/v1
+model:
+  id: test-model
+clipboard: terminal
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.clipboard, ClipboardMode::Terminal);
     }
 
     #[test]

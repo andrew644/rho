@@ -63,7 +63,7 @@ are **not** parity gaps for rho's purposes:
 | RPC mode, JSON event mode, TypeScript SDK | rho embeds its own harness (TUI + Discord bridge) instead |
 | Multiple providers, `/login`/`/logout`, OAuth/subscriptions, auth store, `/llama` router management, `/thinking` levels, `/scoped-models` | Single local OpenAI-compatible provider by design |
 | Session tree: `/tree`, `/fork`, `/clone`, `/import`, branch summaries, session picker UI | Rho keeps linear sessions only (still resumable/compactable) |
-| `/export` (HTML), `/share`, `/bug`, `/copy` (clipboard) | Sharing/telemetry features; review-before-share caveats |
+| `/export` (HTML), `/share`, `/bug` | Sharing/telemetry features; review-before-share caveats. Copying is covered by rho's own mouse selection (see §4) rather than a `/copy` command |
 | `@`-file autocomplete in the TUI, image paste/drag, image tool results | Text-only client by design (see DESIGN.md tools section); `@file` works in CLI print mode |
 | Project trust (`/trust`), settings hierarchy (`settings.json`, project settings) | Single YAML config by design |
 | `/reload`, `/hotkeys`, `/changelog` | Tied to dynamic resource loading |
@@ -75,6 +75,7 @@ are **not** parity gaps for rho's purposes:
 |---|---|
 | `/loop` (forever / N times / duration / until-condition) | Not shipped by pi ("Pi… skips features like sub-agents and plan mode") |
 | Discord remote-control bridge | Gateway websocket + REST relay sharing the serial prompt queue |
+| In-transcript selection with clipboard copy | rho captures the mouse (wheel scroll), so it draws its own selection: drag / double-click word / triple-click row, Ctrl+Y to copy again, OSC 52 with `wl-copy`/`xclip`/`xsel`/`pbcopy` fallback, `clipboard:` config |
 
 ## Step 13 exit criteria
 

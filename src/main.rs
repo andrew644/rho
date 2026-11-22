@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         context_window: config.context_window,
         theme: config.theme,
         session_path: resumed.as_ref().map(|p| p.display().to_string()),
+        clipboard: config.clipboard,
     };
     rho::tui::run(agent_tx, cancel, event_rx, tui).await
 }
