@@ -40,7 +40,8 @@ cargo run
 - Type a prompt and press Enter. The agent streams reasoning (∴), answers,
   and tool activity (#). The input border shows the model, estimated context
   size, and current status.
-- Esc interrupts the current generation/loop. PgUp/PgDn scroll, Up/Down walk
+- Esc interrupts the current generation/loop. The mouse wheel, PgUp/PgDn, and
+  Home/End scroll the transcript (a scrollbar shows the viewport). Up/Down walk
   prompt history. Ctrl+C or `/quit` exits.
 - Tools: `read`, `bash`, `edit`, `write` (same semantics as pi).
 - `!cmd` runs a shell command and shares its output with the model;
