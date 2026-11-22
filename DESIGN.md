@@ -160,3 +160,48 @@ loop:
 11. [x] End-to-end smoke test against the local server
 12. [x] Compare features in Pi and Rho and document what still needs to be implemented (see PARITY.md)
 13. [x] Continue implementing features from Pi until parity is met (sessions, compaction, prompt templates, shell escapes, print mode, /model — see PARITY.md §2)
+
+## UI TODO
+
+Improvements identified from a hands-on review of the running TUI.
+
+### Transcript readability
+
+1. [ ] **Word wrap + reasoning block** — wrapped lines re-prefix `∴ ` and break
+   mid-word ("acknow / ledge"). Wrap on word boundaries with a hanging indent;
+   render reasoning as one dim block; add a Ctrl+R toggle to hide/collapse it.
+2. [ ] **Turn separation** — insert a blank line (or thin separator) between
+   turns so user input, reasoning, tool output, and answers don't run together.
+3. [ ] **Markdown / code rendering** — assistant output shows raw backticks and
+   fences; detect code fences (indent + dim background, no reflow) at minimum,
+   ideally syntax highlighting.
+4. [ ] **Tool output presentation** — replace per-line `# ` prefixes with a
+   single header line (`read Cargo.toml:3 ✓`) followed by 2-column-indented
+   output, capped at N lines with an "… +N lines (expand)" note.
+
+### Status bar / footer
+
+5. [ ] **Real spinner + elapsed time** — replace literal `…….` dots with
+   animated frames (`⠋⠙⠹⠸…`) and show elapsed seconds for the current turn.
+6. [ ] **Context usage as percent** — show `~478/128k (0.4%)` instead of a bare
+   token count; shift color yellow→red as auto-compaction approaches.
+7. [ ] **Footer identity info** — include session name (after `/name`,
+   `--continue`) and cwd basename so side-by-side agents are distinguishable.
+
+### Input UX
+
+8. [ ] **Busy-state input affordance** — dim the input border or show
+   "queued" while the agent is running so it's clear what Enter will do.
+9. [ ] **Slash-command autocomplete** — typing `/` + Tab (or arrows) filters
+   and completes built-in commands and template names.
+10. [ ] **Multiline input** — Shift+Enter / Ctrl+J insert a newline instead of
+    submitting, so pasted multi-line prompts don't fire early.
+
+### Robustness / theming
+
+11. [ ] **Configurable theme** — yellow tool lines and dark-gray reasoning are
+    unreadable on light terminals; add a palette/theme section to config
+    (at least dark/light/ansi variants).
+12. [ ] **Rich welcome screen** — first frame should show version, model,
+    context window, cwd, and session file so config can be verified before the
+    first prompt.
