@@ -1,6 +1,6 @@
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -589,6 +589,14 @@ impl App {
                 self.cursor = self.input.len();
                 false
             }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.insert_text("\n");
+                false
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_text("\n");
+                false
+            }
             KeyCode::Enter => {
                 let input = std::mem::take(&mut self.input);
                 self.cursor = 0;
@@ -625,12 +633,45 @@ impl App {
                 false
             }
             KeyCode::Char(c) => {
-                self.input.insert(self.cursor, c);
-                self.cursor += 1;
+                if c == '\n' {
+                    self.insert_text("\n");
+                } else {
+                    self.input.insert(self.cursor, c);
+                    self.cursor += 1;
+                }
                 false
             }
             _ => false,
         }
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.input.insert_str(self.cursor, &text);
+        self.cursor += text.chars().count();
+    }
+
+    fn input_layout(&self, width: usize, rows: usize) -> (Vec<Line<'static>>, usize, usize) {
+        let rows = rows.max(1);
+        let before: String = self.input.chars().take(self.cursor).collect();
+        let cur_line = before.matches('\n').count();
+        let cur_col = before
+            .chars()
+            .rev()
+            .take_while(|c| *c != '\n')
+            .count();
+        let lines: Vec<&str> = self.input.split('\n').collect();
+        let top = cur_line.saturating_sub(rows - 1);
+        let bottom = (top + rows).min(lines.len());
+        let hscroll = cur_col.saturating_sub(width.saturating_sub(4));
+        let view = (top..bottom)
+            .map(|i| {
+                let prompt = if i == 0 { "❯ " } else { "  " };
+                let text: String = lines[i].chars().skip(hscroll).collect();
+                Line::from(Span::raw(format!("{prompt}{text}")))
+            })
+            .collect();
+        (view, cur_line - top, cur_col.saturating_sub(hscroll))
     }
 
     pub fn scroll_by(&mut self, lines: i32) {
@@ -884,16 +925,18 @@ impl App {
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.update_status();
+        let input_height = if self.input.contains('\n') { 5 } else { 3 };
         let chunks = if self.loop_status.is_some() {
             let split = Layout::vertical([
                 Constraint::Min(3),
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
             ])
             .split(area);
             (Some(split[1]), split[0], split[2])
         } else {
-            let split = Layout::vertical([Constraint::Min(2), Constraint::Length(3)]).split(area);
+            let split = Layout::vertical([Constraint::Min(2), Constraint::Length(input_height)])
+                .split(area);
             (None, split[0], split[1])
         };
 
@@ -971,13 +1014,11 @@ impl App {
             .border_style(border_style);
         let inner = input_block.inner(chunks.2);
         frame.render_widget(input_block, chunks.2);
-        let prompt = Paragraph::new(Span::styled(format!("❯ {}", self.input), Style::default()));
-        frame.render_widget(prompt, inner);
+        let prompt_lines = self.input_layout(inner.width as usize, inner.height as usize);
+        frame.render_widget(Paragraph::new(prompt_lines.0), inner);
         frame.set_cursor_position((
-            inner
-                .x
-                .saturating_add(2 + self.cursor.min(inner.width.saturating_sub(3) as usize) as u16),
-            inner.y,
+            inner.x.saturating_add(2 + prompt_lines.2 as u16),
+            inner.y.saturating_add(prompt_lines.1 as u16),
         ));
     }
 
@@ -993,9 +1034,13 @@ pub async fn run(
     opts: TuiOptions,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = run_inner(&mut terminal, agent, cancel, &mut events, opts).await;
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -1046,6 +1091,7 @@ async fn run_inner(
                         MouseEventKind::ScrollDown => app.scroll_by(-3),
                         _ => {}
                     },
+                    Some(Ok(Event::Paste(text))) => app.insert_text(&text),
                     _ => {}
                 }
             }
@@ -1291,6 +1337,78 @@ mod tests {
         assert_eq!(app.cursor, 2);
         app.handle_key(key(KeyCode::Backspace), &tx, &cancel);
         assert_eq!(app.input, "bc");
+    }
+
+    #[test]
+    fn shift_enter_and_ctrl_j_insert_newlines_without_submitting() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &tx,
+            &cancel,
+        );
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+            &cancel,
+        );
+        assert_eq!(app.input, "a\nb\n");
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn enter_submits_multiline_input_as_one_prompt() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        app.insert_text("line one\nline two");
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        match rx.try_recv().unwrap() {
+            AgentCommand::Prompt { text } => assert_eq!(text, "line one\nline two"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_text_normalizes_paste_line_endings() {
+        let mut app = test_app();
+        app.insert_text("a\r\nb\rc");
+        assert_eq!(app.input, "a\nb\nc");
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[test]
+    fn input_layout_keeps_cursor_line_visible() {
+        let mut app = test_app();
+        app.insert_text("l1\nl2\nl3\nl4");
+        app.cursor = app.input.len();
+        let (view, row, col) = app.input_layout(40, 2);
+        let texts: Vec<String> = view
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["  l3", "  l4"]);
+        assert_eq!((row, col), (1, 2));
+        app.cursor = 3;
+        let (view, row, _) = app.input_layout(40, 2);
+        assert_eq!(row, 1);
+        assert_eq!(view[0].spans[0].content, "❯ l1");
     }
 }
 

@@ -194,7 +194,7 @@ Improvements identified from a hands-on review of the running TUI.
    "queued" while the agent is running so it's clear what Enter will do.
 9. [ ] **Slash-command autocomplete** — typing `/` + Tab (or arrows) filters
    and completes built-in commands and template names.
-10. [ ] **Multiline input** — Shift+Enter / Ctrl+J insert a newline instead of
+10. [x] **Multiline input** — Shift+Enter / Ctrl+J insert a newline instead of
     submitting, so pasted multi-line prompts don't fire early.
 
 ### Robustness / theming
