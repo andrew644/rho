@@ -9,7 +9,7 @@ fn includes_sections_and_tools() {
     assert!(prompt.contains("<tools>"));
     assert!(prompt.contains("- read: Read file contents"));
     assert!(prompt.contains("<rules>"));
-    assert!(prompt.contains("<cwd>"));
+    assert!(prompt.contains("<pwd>"));
     assert!(!prompt.contains("<project_context>"));
 }
 

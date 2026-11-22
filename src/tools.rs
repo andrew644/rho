@@ -48,12 +48,12 @@ pub trait Tool: Send + Sync {
     }
 }
 
-pub fn all_tools(cwd: PathBuf) -> Vec<Box<dyn Tool>> {
+pub fn all_tools(pwd: PathBuf) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ReadTool { cwd: cwd.clone() }),
-        Box::new(BashTool { cwd: cwd.clone() }),
-        Box::new(EditTool { cwd: cwd.clone() }),
-        Box::new(WriteTool { cwd }),
+        Box::new(ReadTool { pwd: pwd.clone() }),
+        Box::new(BashTool { pwd: pwd.clone() }),
+        Box::new(EditTool { pwd: pwd.clone() }),
+        Box::new(WriteTool { pwd }),
     ]
 }
 
@@ -61,19 +61,19 @@ pub fn tool_names() -> Vec<&'static str> {
     vec!["read", "bash", "edit", "write"]
 }
 
-pub fn run_bash(cwd: &Path, command: &str, timeout: Option<u64>) -> ToolResult {
+pub fn run_bash(pwd: &Path, command: &str, timeout: Option<u64>) -> ToolResult {
     BashTool {
-        cwd: cwd.to_path_buf(),
+        pwd: pwd.to_path_buf(),
     }
     .run(command, timeout)
 }
 
-fn resolve(cwd: &Path, path: &str) -> PathBuf {
+fn resolve(pwd: &Path, path: &str) -> PathBuf {
     let p = Path::new(path);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
-        cwd.join(p)
+        pwd.join(p)
     }
 }
 
@@ -84,7 +84,7 @@ fn get_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, ToolRe
 }
 
 pub struct ReadTool {
-    pub cwd: PathBuf,
+    pub pwd: PathBuf,
 }
 
 impl Tool for ReadTool {
@@ -110,7 +110,7 @@ impl Tool for ReadTool {
 
     fn execute(&self, args: &serde_json::Value) -> ToolResult {
         let path = match get_str(args, "path") {
-            Ok(p) => resolve(&self.cwd, p),
+            Ok(p) => resolve(&self.pwd, p),
             Err(e) => return e,
         };
         let content = match std::fs::read_to_string(&path) {
@@ -154,7 +154,7 @@ impl Tool for ReadTool {
 }
 
 pub struct BashTool {
-    pub cwd: PathBuf,
+    pub pwd: PathBuf,
 }
 
 impl BashTool {
@@ -162,7 +162,7 @@ impl BashTool {
         let mut child = match Command::new("bash")
             .arg("-c")
             .arg(command)
-            .current_dir(&self.cwd)
+            .current_dir(&self.pwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -272,7 +272,7 @@ impl Tool for BashTool {
 }
 
 pub struct EditTool {
-    pub cwd: PathBuf,
+    pub pwd: PathBuf,
 }
 
 impl Tool for EditTool {
@@ -308,7 +308,7 @@ impl Tool for EditTool {
 
     fn execute(&self, args: &serde_json::Value) -> ToolResult {
         let path = match get_str(args, "path") {
-            Ok(p) => resolve(&self.cwd, p),
+            Ok(p) => resolve(&self.pwd, p),
             Err(e) => return e,
         };
         let edits = match args.get("edits").and_then(|v| v.as_array()) {
@@ -371,7 +371,7 @@ impl Tool for EditTool {
 }
 
 pub struct WriteTool {
-    pub cwd: PathBuf,
+    pub pwd: PathBuf,
 }
 
 impl Tool for WriteTool {
@@ -396,7 +396,7 @@ impl Tool for WriteTool {
 
     fn execute(&self, args: &serde_json::Value) -> ToolResult {
         let path = match get_str(args, "path") {
-            Ok(p) => resolve(&self.cwd, p),
+            Ok(p) => resolve(&self.pwd, p),
             Err(e) => return e,
         };
         let content = match get_str(args, "content") {

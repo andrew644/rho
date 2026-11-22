@@ -9,7 +9,8 @@ use crate::types::Message;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionHeader {
     pub id: String,
-    pub cwd: String,
+    #[serde(alias = "cwd")]
+    pub pwd: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -38,8 +39,8 @@ pub fn sessions_root() -> PathBuf {
         .join("sessions")
 }
 
-pub fn sessions_dir_for(cwd: &Path) -> PathBuf {
-    sessions_root().join(sanitize_dir_name(&cwd.display().to_string()))
+pub fn sessions_dir_for(pwd: &Path) -> PathBuf {
+    sessions_root().join(sanitize_dir_name(&pwd.display().to_string()))
 }
 
 pub fn sanitize_dir_name(path: &str) -> String {
@@ -98,10 +99,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 impl SessionHeader {
-    pub fn new(cwd: &Path, model: &str) -> Self {
+    pub fn new(pwd: &Path, model: &str) -> Self {
         Self {
             id: generate_id(),
-            cwd: cwd.display().to_string(),
+            pwd: pwd.display().to_string(),
             model: model.to_string(),
             name: None,
             created: timestamp(),
@@ -109,8 +110,8 @@ impl SessionHeader {
     }
 }
 
-pub fn create_session_file(cwd: &Path, header: &SessionHeader) -> Result<PathBuf> {
-    let dir = sessions_dir_for(cwd);
+pub fn create_session_file(pwd: &Path, header: &SessionHeader) -> Result<PathBuf> {
+    let dir = sessions_dir_for(pwd);
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join(format!("{}.jsonl", header.id));
     fs::write(&path, "")?;
@@ -149,8 +150,8 @@ pub fn load_session(path: &Path) -> Result<(SessionHeader, Vec<Message>)> {
     Ok((header, messages))
 }
 
-pub fn list_sessions(cwd: &Path, limit: usize) -> Vec<SessionInfo> {
-    list_sessions_in(&sessions_dir_for(cwd), limit)
+pub fn list_sessions(pwd: &Path, limit: usize) -> Vec<SessionInfo> {
+    list_sessions_in(&sessions_dir_for(pwd), limit)
 }
 
 pub fn list_sessions_in(dir: &Path, limit: usize) -> Vec<SessionInfo> {
@@ -186,8 +187,8 @@ pub fn list_sessions_in(dir: &Path, limit: usize) -> Vec<SessionInfo> {
     sessions
 }
 
-pub fn latest_session(cwd: &Path) -> Option<SessionInfo> {
-    list_sessions(cwd, 1).into_iter().next()
+pub fn latest_session(pwd: &Path) -> Option<SessionInfo> {
+    list_sessions(pwd, 1).into_iter().next()
 }
 
 pub fn update_name(path: &Path, name: &str) -> Result<()> {
@@ -217,7 +218,7 @@ mod tests {
         let path = dir.path().join("s1.jsonl");
         let header = SessionHeader {
             id: "s1".into(),
-            cwd: "/tmp".into(),
+            pwd: "/tmp".into(),
             model: "m".into(),
             name: Some("work".into()),
             created: "2026-01-01T00:00:00Z".into(),
@@ -248,7 +249,7 @@ mod tests {
         let path = dir.path().join("s3.jsonl");
         let header = SessionHeader {
             id: "s3".into(),
-            cwd: "/tmp".into(),
+            pwd: "/tmp".into(),
             model: "m".into(),
             name: None,
             created: "2026-01-02T00:00:00Z".into(),
@@ -270,7 +271,7 @@ mod tests {
         let write = |id: &str, created: &str, name: Option<&str>| {
             let header = SessionHeader {
                 id: id.into(),
-                cwd: "/tmp/proj".into(),
+                pwd: "/tmp/proj".into(),
                 model: "m".into(),
                 name: name.map(Into::into),
                 created: created.into(),

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,6 +28,7 @@ pub enum AgentCommand {
     Resume { path: PathBuf },
     SetName { name: String },
     SetModel { id: String },
+    SetPwd { path: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +63,7 @@ pub enum AgentEvent {
         message_count: usize,
         session_path: Option<String>,
         session_name: Option<String>,
+        pwd: String,
     },
     Idle,
     Error(String),
@@ -73,7 +75,7 @@ pub struct Agent {
     tools: Vec<Arc<dyn Tool>>,
     history: Vec<Message>,
     cancel: Arc<AtomicBool>,
-    cwd: PathBuf,
+    pwd: PathBuf,
     model: String,
     session_path: Option<PathBuf>,
     session_header: Option<SessionHeader>,
@@ -81,22 +83,37 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn resolve_pwd(current: &Path, input: &Path) -> Result<PathBuf, String> {
+        let joined = if input.is_absolute() {
+            input.to_path_buf()
+        } else {
+            current.join(input)
+        };
+        let canonical = joined
+            .canonicalize()
+            .map_err(|e| format!("cannot use {}: {e}", joined.display()))?;
+        if !canonical.is_dir() {
+            return Err(format!("not a directory: {}", canonical.display()));
+        }
+        Ok(canonical)
+    }
+
     pub fn spawn(
         config: Config,
-        cwd: PathBuf,
+        pwd: PathBuf,
         events: broadcast::Sender<AgentEvent>,
     ) -> (UnboundedSender<AgentCommand>, Arc<AtomicBool>) {
-        Self::spawn_resumed(config, cwd, events, None)
+        Self::spawn_resumed(config, pwd, events, None)
     }
 
     pub fn spawn_resumed(
         config: Config,
-        cwd: PathBuf,
+        pwd: PathBuf,
         events: broadcast::Sender<AgentEvent>,
         resumed: Option<PathBuf>,
     ) -> (UnboundedSender<AgentCommand>, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
-        let system = Message::system(build_system_prompt(&cwd));
+        let system = Message::system(build_system_prompt(&pwd));
         let (history, session_path, session_header) = match resumed {
             Some(path) => match session::load_session(&path) {
                 Ok((header, messages)) => {
@@ -116,10 +133,10 @@ impl Agent {
             client: Client::new(&config.provider.base_url, &config.provider.api_key),
             model: config.model.id.clone(),
             config,
-            tools: all_tools(cwd.clone()).into_iter().map(Arc::from).collect(),
+            tools: all_tools(pwd.clone()).into_iter().map(Arc::from).collect(),
             history,
             cancel: cancel.clone(),
-            cwd,
+            pwd,
             truncation_recovery_used: false,
             session_path,
             session_header,
@@ -153,12 +170,12 @@ impl Agent {
                         agent.run_shell(&command, to_model, &events).await;
                     }
                     AgentCommand::NewSession => {
-                        agent.history = vec![Message::system(build_system_prompt(&agent.cwd))];
+                        agent.history = vec![Message::system(build_system_prompt(&agent.pwd))];
                         agent.new_session_file();
                     }
                     AgentCommand::Resume { path } => match session::load_session(&path) {
                         Ok((header, messages)) => {
-                            let mut h = vec![Message::system(build_system_prompt(&agent.cwd))];
+                            let mut h = vec![Message::system(build_system_prompt(&agent.pwd))];
                             h.extend(messages);
                             agent.history = h;
                             agent.session_header = Some(header);
@@ -191,6 +208,27 @@ impl Agent {
                             let _ = events.send(AgentEvent::Info(format!("model: {id}")));
                         }
                     }
+                    AgentCommand::SetPwd { path } => {
+                        match Agent::resolve_pwd(&agent.pwd, &path) {
+                            Ok(pwd) => {
+                                agent.pwd = pwd.clone();
+                                agent.tools =
+                                    all_tools(pwd.clone()).into_iter().map(Arc::from).collect();
+                                if let Some(first) = agent.history.first_mut() {
+                                    *first = Message::system(build_system_prompt(&pwd));
+                                }
+                                agent.history.push(Message::user(format!(
+                                    "The working directory changed to {}.",
+                                    pwd.display()
+                                )));
+                                let _ = events
+                                    .send(AgentEvent::Info(format!("pwd: {}", pwd.display())));
+                            }
+                            Err(e) => {
+                                let _ = events.send(AgentEvent::Error(e));
+                            }
+                        }
+                    }
                 }
                 agent.persist(&events);
                 let _ = events.send(AgentEvent::Idle);
@@ -221,8 +259,8 @@ impl Agent {
     }
 
     fn new_session_file(&mut self) {
-        let header = SessionHeader::new(&self.cwd, &self.model);
-        match session::create_session_file(&self.cwd, &header) {
+        let header = SessionHeader::new(&self.pwd, &self.model);
+        match session::create_session_file(&self.pwd, &header) {
             Ok(path) => {
                 self.session_header = Some(header);
                 self.session_path = Some(path);
@@ -254,6 +292,7 @@ impl Agent {
             message_count: self.history.len(),
             session_path: self.session_path.as_ref().map(|p| p.display().to_string()),
             session_name: self.session_header.as_ref().and_then(|h| h.name.clone()),
+            pwd: self.pwd.display().to_string(),
         });
     }
 
@@ -267,11 +306,11 @@ impl Agent {
             name: "bash".to_string(),
             args: command.to_string(),
         });
-        let cwd = self.cwd.clone();
+        let pwd = self.pwd.clone();
         let command = command.to_string();
         let cmd_for_task = command.clone();
         let result =
-            tokio::task::spawn_blocking(move || crate::tools::run_bash(&cwd, &cmd_for_task, None))
+            tokio::task::spawn_blocking(move || crate::tools::run_bash(&pwd, &cmd_for_task, None))
                 .await
                 .unwrap_or_else(|e| ToolResult::err(format!("shell task failed: {e}")));
         let _ = events.send(AgentEvent::ToolFinished {
@@ -566,5 +605,30 @@ impl Agent {
             answer.content.as_str()
         };
         Ok(text.trim().to_uppercase().contains("YES"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Agent;
+
+    #[test]
+    fn resolve_pwd_accepts_absolute_and_relative_dirs() {
+        let d = tempfile::tempdir().unwrap();
+        let sub = d.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let abs = Agent::resolve_pwd(std::path::Path::new("/"), &d.path().to_path_buf()).unwrap();
+        assert!(abs.is_dir());
+        let rel = Agent::resolve_pwd(&abs, std::path::Path::new("sub")).unwrap();
+        assert_eq!(rel, sub.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_pwd_rejects_missing_paths_and_files() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(Agent::resolve_pwd(d.path(), std::path::Path::new("nope")).is_err());
+        let file = d.path().join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(Agent::resolve_pwd(d.path(), &file).is_err());
     }
 }

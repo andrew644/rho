@@ -41,7 +41,7 @@ cargo run
 - Type a prompt and press Enter. The agent streams reasoning (∴), answers,
   and tool activity. Tool calls render as one header line (`bash ls -la ✓`)
   with indented output; long output is capped — Ctrl+O expands it. Code fences
-  render as indented blocks. The footer shows session/cwd, model, an animated
+  render as indented blocks. The footer shows session/pwd, model, an animated
   spinner with elapsed time, and context usage as a percentage of the window
   (yellow/red as auto-compaction approaches). While the agent runs, the input
   border dims and Enter queues the text.
@@ -53,7 +53,8 @@ cargo run
   (pasted multiline text is never submitted early); Enter submits.
 - Tools: `read`, `bash`, `edit`, `write` (same semantics as pi).
 - `!cmd` runs a shell command and shares its output with the model;
-  `!!cmd` runs it without sharing.
+  `!!cmd` runs it without sharing. `/pwd <path>` changes the working
+  directory for tools, agent requests, and `!`/`!!` commands.
 
 ### Commands
 
@@ -65,6 +66,7 @@ cargo run
 /session                                    session file, id, message/token counts
 /name <text>                                name the current session
 /model [id]                                 list models / switch
+/pwd [path]                                 show / change the working directory
 /stop  /help  /quit
 ```
 

@@ -9,8 +9,8 @@ pub struct Template {
     pub body: String,
 }
 
-pub fn template_dirs(user_dir: PathBuf, cwd: &Path) -> Vec<PathBuf> {
-    vec![user_dir, cwd.join(".rho").join("prompts")]
+pub fn template_dirs(user_dir: PathBuf, pwd: &Path) -> Vec<PathBuf> {
+    vec![user_dir, pwd.join(".rho").join("prompts")]
 }
 
 pub fn load_templates(dirs: &[PathBuf]) -> Vec<Template> {
@@ -240,7 +240,7 @@ pub fn render_help(templates: &[Template]) -> String {
     out
 }
 
-pub fn expand_at_references(cwd: &Path, text: &str, max_bytes: usize) -> String {
+pub fn expand_at_references(pwd: &Path, text: &str, max_bytes: usize) -> String {
     let mut additions = Vec::new();
     for token in text.split_whitespace() {
         let Some(path) = token.strip_prefix('@') else {
@@ -253,7 +253,7 @@ pub fn expand_at_references(cwd: &Path, text: &str, max_bytes: usize) -> String 
         let full = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            cwd.join(p)
+            pwd.join(p)
         };
         let content = match fs::read_to_string(&full) {
             Ok(c) => c,

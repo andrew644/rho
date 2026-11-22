@@ -45,7 +45,7 @@ under rho's design constraints is. This document splits pi's features into:
 | `/model` model selection | `model.models` list in config; `/model` lists, `/model <id>` switches; CLI `--model` override |
 | Multi-line editor (Shift+Enter), tool-output expand (Ctrl+O), thinking toggle (Ctrl+R in rho) | Shift+Enter/Ctrl+J insert newlines (bracketed paste inserts verbatim); Ctrl+O expands capped tool output; Ctrl+R shows/hides reasoning |
 | Slash-command and template autocomplete | Tab / Shift-Tab cycle matching commands and template names |
-| Footer showing model, context usage | Status bar shows session/cwd, model id, spinner + elapsed time, context usage as percent with yellow/red thresholds, session name |
+| Footer showing model, context usage | Status bar shows session/pwd, model id, spinner + elapsed time, context usage as percent with yellow/red thresholds, session name |
 
 ## 3. Out of scope by design
 

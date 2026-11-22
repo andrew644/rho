@@ -13,7 +13,7 @@ rho
 ├── config      ~/.config/rho/config.yaml → Provider, Model, Loop, Compaction, Discord settings
 ├── client      OpenAI-compatible chat-completions client (SSE streaming, tool calls, reasoning_content)
 ├── tools       read, bash, edit, write (same schemas/semantics as pi)
-├── prompt      system prompt builder (preamble/tools/rules/docs/cwd sections + AGENTS.md project context)
+├── prompt      system prompt builder (preamble/tools/rules/docs/pwd sections + AGENTS.md project context)
 ├── agent       the agentic loop: user msg → stream → tool calls → results → repeat
 ├── loops       /loop command: forever | N times | duration | until-condition prompt
 ├── session     JSONL session persistence per working directory (/new /resume /session /name, --continue)
@@ -59,7 +59,7 @@ Same four tools, names, JSON schemas and descriptions as pi:
 
 Built in pi's sectioned form: preamble ("You are a coding assistant running
 inside rho…"), `<tools>`, `<rules>`, `<project_context>` (contents of
-`AGENTS.md` in cwd, if present), `<cwd>`.
+`AGENTS.md` in the working directory, if present), `<pwd>`.
 
 ### Sessions
 
@@ -67,7 +67,15 @@ Every conversation is saved automatically as JSONL (`header` record +
 `message` records) under the OS state directory, grouped by working
 directory. `/new`, `/resume [n]`, `/session`, `/name`, and `rho --continue`
 manage sessions; resumed sessions rebuild the history under a freshly built
-system prompt for the current cwd.
+system prompt for the current working directory.
+
+### /pwd
+
+`/pwd [path]` prints or changes the working directory. Relative paths resolve
+against the current pwd. Changing it rebuilds the tools (so `read`/`bash`/
+`edit`/`write` resolve relative paths against the new pwd), rebuilds the
+system prompt for the new directory (including its `AGENTS.md`), notifies the
+model, and redirects subsequent `!` / `!!` shell commands.
 
 ### Compaction
 

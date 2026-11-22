@@ -2,11 +2,11 @@ use std::path::Path;
 
 const CONTEXT_FILES: [&str; 1] = ["AGENTS.md"];
 
-pub fn load_context_files(cwd: &Path) -> Vec<(String, String)> {
+pub fn load_context_files(pwd: &Path) -> Vec<(String, String)> {
     CONTEXT_FILES
         .iter()
         .filter_map(|name| {
-            let path = cwd.join(name);
+            let path = pwd.join(name);
             let content = std::fs::read_to_string(&path).ok()?;
             Some((name.to_string(), content))
         })
@@ -25,7 +25,7 @@ fn tool_snippets() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-pub fn build_system_prompt(cwd: &Path) -> String {
+pub fn build_system_prompt(pwd: &Path) -> String {
     let mut sections = Vec::new();
 
     sections.push(
@@ -59,7 +59,7 @@ pub fn build_system_prompt(cwd: &Path) -> String {
             .join("\n")
     ));
 
-    let context_files = load_context_files(cwd);
+    let context_files = load_context_files(pwd);
     if !context_files.is_empty() {
         let rendered = context_files
             .iter()
@@ -75,7 +75,7 @@ pub fn build_system_prompt(cwd: &Path) -> String {
         ));
     }
 
-    sections.push(format!("<cwd>\n{}\n</cwd>", cwd.display()));
+    sections.push(format!("<pwd>\n{}\n</pwd>", pwd.display()));
 
     sections.join("\n\n")
 }

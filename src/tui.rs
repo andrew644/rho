@@ -40,6 +40,7 @@ pub enum Command {
     Session,
     Name(String),
     Model(String),
+    Pwd(String),
     Template { name: String, args: String },
     Shell { command: String, to_model: bool },
     Unknown(String),
@@ -90,6 +91,7 @@ pub fn classify_input(input: &str, template_names: &[String]) -> Option<InputAct
             "session" => Command::Session,
             "name" => Command::Name(args.to_string()),
             "model" => Command::Model(args.to_string()),
+            "pwd" => Command::Pwd(args.to_string()),
             other if template_names.iter().any(|t| t == other) => Command::Template {
                 name: other.to_string(),
                 args: args.to_string(),
@@ -248,9 +250,9 @@ fn assistant_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-const BUILTIN_COMMANDS: [&str; 11] = [
-    "compact", "exit", "help", "loop", "model", "name", "new", "quit", "resume", "session",
-    "stop",
+const BUILTIN_COMMANDS: [&str; 12] = [
+    "compact", "exit", "help", "loop", "model", "name", "new", "pwd", "quit", "resume",
+    "session", "stop",
 ];
 
 fn fmt_tokens(n: usize) -> String {
@@ -384,7 +386,7 @@ pub struct App {
     quit: bool,
     follow: bool,
     last_rendered_lines: usize,
-    cwd: PathBuf,
+    pwd: PathBuf,
     model: String,
     theme: Theme,
     context_window: u32,
@@ -399,7 +401,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        cwd: PathBuf,
+        pwd: PathBuf,
         model: String,
         known_models: Vec<String>,
         templates: Vec<Template>,
@@ -408,10 +410,10 @@ impl App {
         session_path: Option<String>,
     ) -> Self {
         let welcome = format!(
-            "rho v{} · model {model} · context {} tokens\ncwd {}\nsession {}\n/help for commands · Esc interrupts · Ctrl+R toggles reasoning · Ctrl+O expands tool output",
+            "rho v{} · model {model} · context {} tokens\npwd {}\nsession {}\n/help for commands · Esc interrupts · Ctrl+R toggles reasoning · Ctrl+O expands tool output",
             env!("CARGO_PKG_VERSION"),
             fmt_tokens(context_window as usize),
-            cwd.display(),
+            pwd.display(),
             session_path.as_deref().unwrap_or("(new session)"),
         );
         Self {
@@ -439,7 +441,7 @@ impl App {
             quit: false,
             follow: true,
             last_rendered_lines: 0,
-            cwd,
+            pwd,
             model,
             theme,
             context_window,
@@ -634,11 +636,13 @@ impl App {
                 message_count,
                 session_path,
                 session_name,
+                pwd,
             } => {
                 self.est_tokens = est_tokens;
                 self.message_count = message_count;
                 self.session_path = session_path;
                 self.session_name = session_name;
+                self.pwd = PathBuf::from(pwd);
             }
             AgentEvent::Error(message) => {
                 self.push(message, Kind::Error);
@@ -874,14 +878,14 @@ impl App {
     }
 
     fn footer_title(&self) -> Line<'static> {
-        let cwd_name = self
-            .cwd
+        let pwd_name = self
+            .pwd
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.cwd.display().to_string());
+            .unwrap_or_else(|| self.pwd.display().to_string());
         let ident = match &self.session_name {
-            Some(name) if !name.is_empty() => format!("{name} · {cwd_name}"),
-            _ => cwd_name,
+            Some(name) if !name.is_empty() => format!("{name} · {pwd_name}"),
+            _ => pwd_name,
         };
         let (usage, usage_color) = self.context_usage();
         Line::from(vec![
@@ -910,7 +914,7 @@ impl App {
 
     fn show_help(&mut self) {
         self.push(
-            "commands: /loop [forever|N|10m|until \"cond\"] <task>, /compact [instructions], /new, /resume [n], /session, /name <text>, /model [id], /stop, /help, /quit",
+            "commands: /loop [forever|N|10m|until \"cond\"] <task>, /compact [instructions], /new, /resume [n], /session, /name <text>, /model [id], /pwd [path], /stop, /help, /quit",
             Kind::Info,
         );
         self.push("!cmd runs a shell command and shares its output with the model; !!cmd runs it without sharing", Kind::Info);
@@ -924,7 +928,7 @@ impl App {
     }
 
     fn show_sessions(&mut self) {
-        self.session_list = session::list_sessions(&self.cwd, 10);
+        self.session_list = session::list_sessions(&self.pwd, 10);
         if self.session_list.is_empty() {
             self.push("no saved sessions for this directory", Kind::Info);
             return;
@@ -980,6 +984,16 @@ impl App {
                 self.entries.clear();
                 self.pending = None;
                 self.push("new session started", Kind::Info);
+            }
+            Some(InputAction::Command(Command::Pwd(path))) => {
+                if path.is_empty() {
+                    self.push(format!("pwd: {}", self.pwd.display()), Kind::Info);
+                } else {
+                    self.history.push(format!("/pwd {path}"));
+                    let _ = agent.send(AgentCommand::SetPwd {
+                        path: PathBuf::from(path),
+                    });
+                }
             }
             Some(InputAction::Command(Command::Resume(args))) => {
                 if args.is_empty() {
@@ -1185,7 +1199,7 @@ pub async fn run(
 }
 
 pub struct TuiOptions {
-    pub cwd: PathBuf,
+    pub pwd: PathBuf,
     pub model: String,
     pub known_models: Vec<String>,
     pub templates: Vec<Template>,
@@ -1202,7 +1216,7 @@ async fn run_inner(
     opts: TuiOptions,
 ) -> anyhow::Result<()> {
     let mut app = App::new(
-        opts.cwd,
+        opts.pwd,
         opts.model,
         opts.known_models,
         opts.templates,
@@ -1741,7 +1755,38 @@ mod draw_tests {
     }
 
     #[test]
-    fn welcome_shows_version_model_context_cwd_session() {
+    fn classify_pwd_command() {
+        let tpl: Vec<String> = vec![];
+        assert_eq!(
+            classify_input("/pwd /tmp/other", &tpl),
+            Some(InputAction::Command(Command::Pwd("/tmp/other".into())))
+        );
+        assert_eq!(
+            classify_input("/pwd", &tpl),
+            Some(InputAction::Command(Command::Pwd(String::new())))
+        );
+    }
+
+    #[test]
+    fn pwd_command_sends_setpwd_or_shows_current() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.on_submit("/pwd", &tx);
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| e.kind == Kind::Info && e.text.contains("pwd:"))
+        );
+        assert!(rx.try_recv().is_err());
+        app.on_submit("/pwd ../elsewhere", &tx);
+        match rx.try_recv().unwrap() {
+            AgentCommand::SetPwd { path } => assert_eq!(path, PathBuf::from("../elsewhere")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn welcome_shows_version_model_context_pwd_session() {
         let app = App::new(
             PathBuf::from("/home/user/repo"),
             "qwen4exp".into(),
@@ -2026,7 +2071,7 @@ mod scroll_tests {
     }
 
     #[test]
-    fn footer_shows_session_name_and_cwd() {
+    fn footer_shows_session_name_and_pwd() {
         let mut app = test_app();
         let title = app.footer_title();
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();

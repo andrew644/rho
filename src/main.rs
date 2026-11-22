@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         config.model.models.retain(|m| m != model);
         config.model.models.insert(0, config.model.id.clone());
     }
-    let cwd = std::env::current_dir()?;
+    let pwd = std::env::current_dir()?;
 
     let mut prompt = cli.prompts.join(" ");
     if prompt.is_empty() && !std::io::stdin().is_terminal() {
@@ -108,11 +108,11 @@ async fn main() -> anyhow::Result<()> {
             prompt = format!("{piped}\n\n{prompt}");
         }
     }
-    let prompt = templates::expand_at_references(&cwd, &prompt, MAX_BYTES);
+    let prompt = templates::expand_at_references(&pwd, &prompt, MAX_BYTES);
 
     let resumed = cli.resume.clone().or_else(|| {
         cli.continue_session
-            .then(|| session::latest_session(&cwd))
+            .then(|| session::latest_session(&pwd))
             .flatten()
             .map(|s| s.path)
     });
@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::broadcast::channel(512);
     let (agent_tx, cancel) =
-        Agent::spawn_resumed(config.clone(), cwd.clone(), event_tx.clone(), resumed.clone());
+        Agent::spawn_resumed(config.clone(), pwd.clone(), event_tx.clone(), resumed.clone());
     if config.discord.enabled {
         rho::discord::spawn(config.clone(), agent_tx.clone(), event_tx.clone());
     }
@@ -141,9 +141,9 @@ async fn main() -> anyhow::Result<()> {
         models.extend(config.model.models.iter().cloned());
         models
     };
-    let loaded_templates = templates::load_templates(&template_dirs(user_dir, &cwd));
+    let loaded_templates = templates::load_templates(&template_dirs(user_dir, &pwd));
     let tui = TuiOptions {
-        cwd,
+        pwd,
         model: config.model.id.clone(),
         known_models: known,
         templates: loaded_templates,
