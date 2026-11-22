@@ -164,6 +164,8 @@ pub struct App {
     busy: bool,
     current_tool: Option<String>,
     quit: bool,
+    follow: bool,
+    last_rendered_lines: usize,
     cwd: PathBuf,
     model: String,
     known_models: Vec<String>,
@@ -198,6 +200,8 @@ impl App {
             busy: false,
             current_tool: None,
             quit: false,
+            follow: true,
+            last_rendered_lines: 0,
             cwd,
             model,
             known_models,
@@ -220,7 +224,9 @@ impl App {
             text: text.into(),
             kind,
         });
-        self.scroll_from_bottom = 0;
+        if self.follow {
+            self.scroll_from_bottom = 0;
+        }
     }
 
     fn flush_pending(&mut self) {
@@ -242,7 +248,9 @@ impl App {
                 });
             }
         }
-        self.scroll_from_bottom = 0;
+        if self.follow {
+            self.scroll_from_bottom = 0;
+        }
     }
 
     pub fn on_event(&mut self, event: AgentEvent) {
@@ -350,14 +358,17 @@ impl App {
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::PageUp => {
+                self.follow = false;
                 self.scroll_from_bottom += 10;
                 false
             }
             KeyCode::PageDown => {
                 self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(10);
+                self.follow = self.scroll_from_bottom == 0;
                 false
             }
             KeyCode::End => {
+                self.follow = true;
                 self.scroll_from_bottom = 0;
                 false
             }
@@ -446,6 +457,8 @@ impl App {
         agent: &mpsc::UnboundedSender<AgentCommand>,
     ) {
         self.history.push(display.to_string());
+        self.follow = true;
+        self.scroll_from_bottom = 0;
         self.push(display.to_string(), Kind::User);
         self.busy = true;
         self.status = "thinking…".to_string();
@@ -634,11 +647,16 @@ impl App {
         if let Some(pending) = &self.pending {
             append_entry(pending, &mut lines);
         }
+        let new_lines = lines.len().saturating_sub(self.last_rendered_lines);
+        if !self.follow && new_lines > 0 {
+            self.scroll_from_bottom += new_lines;
+        }
+        self.last_rendered_lines = lines.len();
         let visible = chunks.1.height as usize;
         let scroll = lines
             .len()
             .saturating_sub(visible + self.scroll_from_bottom);
-        let paragraph = Paragraph::new(lines).scroll((0, scroll as u16));
+        let paragraph = Paragraph::new(lines).scroll((scroll as u16, 0));
         frame.render_widget(paragraph, chunks.1);
 
         if let Some(bar) = chunks.0 {
@@ -1002,5 +1020,108 @@ mod draw_tests {
             app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
         }
         assert!(app.handle_key(key(KeyCode::Enter), &tx, &cancel));
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn render(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+
+
+    #[test]
+    fn pages_vertically_not_horizontally() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+        );
+        for i in 0..60 {
+            app.push(format!("line {i}"), Kind::Tool);
+        }
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.iter().any(|l| l.contains("line 59")), "{screen:#?}");
+        assert!(
+            !screen.iter().any(|l| l.contains("line 10")),
+            "older lines should be scrolled past"
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.iter().any(|l| l.contains("line 45")), "after PgUp: {screen:#?}");
+        assert!(
+            !screen.iter().any(|l| l.contains("line 59")),
+            "tail should scroll off after PgUp"
+        );
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.iter().any(|l| l.contains("line 59")), "after PageDown");
+    }
+
+
+    #[test]
+    fn scrolled_view_survives_streaming_output() {
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        for i in 0..60 {
+            app.push(format!("line {i}"), Kind::Tool);
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        let before = render(&mut app, 80, 24);
+        app.on_event(AgentEvent::TextDelta("more streaming text".into()));
+        app.on_event(AgentEvent::ToolStarted {
+            name: "bash".into(),
+            args: "long job".into(),
+        });
+        let after = render(&mut app, 80, 24);
+        assert_eq!(before[5], after[5], "view must not jump while scrolled up");
+        app.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &tx,
+            &cancel,
+        );
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.iter().any(|l| l.contains("more streaming text")), "{screen:#?}");
+        assert!(screen.iter().any(|l| l.contains("bash")));
+    }
+
+    #[test]
+    fn long_lines_wrap_within_width() {
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        app.push("x".repeat(500), Kind::Assistant);
+        let screen = render(&mut app, 80, 24);
+        for row in &screen {
+            assert!(row.trim_end().chars().count() <= 80, "row too wide: {row:?}");
+        }
+        assert!(screen.iter().any(|l| l.starts_with('x')));
     }
 }
