@@ -25,7 +25,7 @@ model:
 # discord:
 #   enabled: true
 #   bot_token: "..."
-#   channel_id: "..."        # optional; DMs/other channels also accepted
+#   channel_id: "..."        # optional; where TUI prompts are mirrored
 #   allowed_user_id: "..."   # optional; restrict who may drive the agent
 # loop_config:
 #   max_turns_per_run: 64
@@ -152,20 +152,31 @@ With `discord.enabled`, rho connects to the Discord gateway as a bot and
 pipes messages from the configured channel (or DMs) into the same serial
 prompt queue as the TUI; final answers are posted back, split at 2000 chars.
 
-`channel_id` is where replies go, so leave it empty and rho reads messages but
-never answers. The simplest working setup is a DM with the bot: message the
-bot once, right-click the DM channel to copy its ID, and put that ID in
-`channel_id`. Discord strips message text for server channels unless the bot
-has the privileged *Message Content Intent*, which rho does not request, so DM
-the bot rather than adding it to a server.
+Replies go back to the channel the question came from: DM the bot and the
+answer appears in the DM, post in a server channel and it appears in that
+channel. `channel_id` is only the fallback destination, used for prompts that
+have no Discord origin (typed in the TUI or `rho -p`); leave it empty and
+those are not mirrored to Discord, while messages sent to the bot still get
+answered where they were sent.
+
+Reading text in a **server** channel needs the privileged *Message Content
+Intent*: without it Discord delivers `MESSAGE_CREATE` for server channels with
+an empty `content` field, so rho sees the message but has no text to enqueue
+(DM text is never stripped, which is why DMs work without it). Enable it for
+the bot under *Bot → Privileged Gateway Intents → Message Content Intent* in
+the developer portal. When the intent is not granted the gateway closes the
+`IDENTIFY` with `4013 Disallowed intents`; rho drops the intent, prints a
+warning and reconnects, so DMs keep working but server channels stay unread.
+`allowed_user_id` restricts who may drive the agent, and messages from bots
+are always ignored.
 
 Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
 retried after the `Retry-After` Discord reports (up to 3 attempts); a full
 outbox drops the newest chunks instead of blocking the agent. Dropped
 gateway connections resume with `op 6` using the saved `session_id`/`seq` when
 possible, otherwise they re-identify, and reconnect waits back off from 1 s to
-60 s. Authentication and intent failures (`4004`, `4013`, `4014`) stop the
-bridge instead of retrying; progress and failures print to stderr.
+60 s. Authentication failures (`4004`, `4014`) stop the bridge instead of
+retrying; progress and failures print to stderr.
 
 Replies are posted with `Authorization: Bot <token>`, so `discord.bot_token`
 must hold the bot token from the developer portal (not an OAuth2 access

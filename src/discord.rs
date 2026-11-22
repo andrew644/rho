@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -15,7 +17,14 @@ type Ws =
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const GATEWAY_QUERY: &str = "v=10&encoding=json";
-const INTENTS: u64 = (1 << 0) | (1 << 11) | (1 << 12);
+
+const GUILDS: u64 = 1 << 0;
+const GUILD_MESSAGE_CONTENT: u64 = 1 << 10;
+const GUILD_MESSAGES: u64 = 1 << 11;
+const DIRECT_MESSAGES: u64 = 1 << 12;
+const INTENTS: u64 = GUILDS | GUILD_MESSAGE_CONTENT | GUILD_MESSAGES | DIRECT_MESSAGES;
+const DISALLOWED_INTENTS: u16 = 4013;
+
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
 
 const SENDS_PER_WINDOW: usize = 4;
@@ -63,10 +72,14 @@ pub fn chunk_message(text: &str) -> Vec<String> {
     chunks
 }
 
-pub fn push_chunks(outbox: &mpsc::Sender<String>, chunks: &[String]) -> usize {
+pub fn push_chunks(outbox: &mpsc::Sender<Posted>, channel_id: &str, chunks: &[String]) -> usize {
     let mut dropped = 0;
-    for chunk in chunks {
-        if outbox.try_send(chunk.clone()).is_err() {
+    for text in chunks {
+        let posted = Posted {
+            channel_id: channel_id.to_string(),
+            text: text.clone(),
+        };
+        if outbox.try_send(posted).is_err() {
             dropped += 1;
         }
     }
@@ -117,6 +130,7 @@ pub fn reconnect_for_close(code: u16) -> Reconnect {
 pub struct GatewayError {
     pub message: String,
     pub reconnect: Reconnect,
+    pub close_code: u16,
 }
 
 impl GatewayError {
@@ -124,7 +138,27 @@ impl GatewayError {
         Self {
             message: message.into(),
             reconnect,
+            close_code: 0,
         }
+    }
+
+    fn closed(message: impl Into<String>, code: u16) -> Self {
+        Self {
+            message: message.into(),
+            reconnect: reconnect_for_close(code),
+            close_code: code,
+        }
+    }
+}
+
+/// Discord rejects `IDENTIFY` with `4013` when a privileged intent is not
+/// enabled in the developer portal. Dropping it keeps DMs working, so the
+/// bridge degrades instead of stopping; there is nothing leaner to give up.
+pub fn downgrade_intents(intents: u64, close_code: u16) -> Option<u64> {
+    if close_code == DISALLOWED_INTENTS && intents & GUILD_MESSAGE_CONTENT != 0 {
+        Some(intents & !GUILD_MESSAGE_CONTENT)
+    } else {
+        None
     }
 }
 
@@ -295,42 +329,113 @@ fn parse_seconds(raw: Option<&str>) -> Option<f64> {
         .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
+/// Decides which Discord channel an agent answer belongs to. Prompts run one
+/// at a time in the agent's queue, so the channel each accepted Discord
+/// message arrived in is queued and handed back in the same order; answers to
+/// prompts that never came through Discord go to the configured channel.
+#[derive(Debug)]
+pub struct Router {
+    waiting: Mutex<VecDeque<String>>,
+    fallback: String,
+}
+
+impl Router {
+    pub fn new(fallback: &str) -> Self {
+        Self {
+            waiting: Mutex::new(VecDeque::new()),
+            fallback: fallback.trim().to_string(),
+        }
+    }
+
+    pub fn expect_reply(&self, channel_id: &str) {
+        let channel_id = channel_id.trim();
+        if channel_id.is_empty() {
+            return;
+        }
+        self.lock().push_back(channel_id.to_string());
+    }
+
+    pub fn take(&self) -> Option<String> {
+        let mut waiting = self.lock();
+        match waiting.pop_front() {
+            Some(channel_id) => Some(channel_id),
+            None => (!self.fallback.is_empty()).then(|| self.fallback.clone()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, VecDeque<String>> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 pub fn spawn(
     config: Config,
     agent_tx: mpsc::UnboundedSender<AgentCommand>,
     events: broadcast::Sender<AgentEvent>,
 ) {
     if config.discord.channel_id.is_empty() {
-        eprintln!("discord: channel_id is empty, replies will not be delivered");
+        eprintln!(
+            "discord: channel_id is empty, prompts typed in the TUI will not be posted; \
+             messages sent to the bot are still answered where they were sent"
+        );
     }
     if config.discord.bot_token.trim().is_empty() {
         eprintln!("discord: bot_token is empty, replies will be rejected with 401");
     }
-    let (outbox_tx, outbox_rx) = mpsc::channel::<String>(OUTBOX_DEPTH);
-    tokio::spawn(reply_relay(events.subscribe(), outbox_tx));
+    let router = Arc::new(Router::new(&config.discord.channel_id));
+    let (outbox_tx, outbox_rx) = mpsc::channel::<Posted>(OUTBOX_DEPTH);
+    tokio::spawn(reply_relay(events.subscribe(), outbox_tx, router.clone()));
     tokio::spawn(Outbox::new(config.discord.clone(), outbox_rx).run());
-    tokio::spawn(connect_loop(config, agent_tx));
+    tokio::spawn(connect_loop(config, agent_tx, router));
 }
 
-async fn connect_loop(config: Config, agent_tx: mpsc::UnboundedSender<AgentCommand>) {
+async fn connect_loop(
+    config: Config,
+    agent_tx: mpsc::UnboundedSender<AgentCommand>,
+    router: Arc<Router>,
+) {
     let mut session = GatewaySession::default();
     let mut backoff = Backoff::new(BACKOFF_START, BACKOFF_MAX);
+    let mut intents = INTENTS;
     loop {
-        match gateway_session(&config, &agent_tx, &mut session, &mut backoff).await {
+        let outcome = gateway_session(
+            &config,
+            &agent_tx,
+            &router,
+            &mut session,
+            &mut backoff,
+            intents,
+        )
+        .await;
+        match outcome {
             Ok(()) => session.clear(),
-            Err(error) => match error.reconnect {
-                Reconnect::Fatal => {
-                    eprintln!("discord gateway stopped: {}", error.message);
-                    return;
-                }
-                Reconnect::Fresh => {
+            Err(error) => {
+                if let Some(leaner) = downgrade_intents(intents, error.close_code) {
+                    intents = leaner;
                     session.clear();
-                    eprintln!("discord gateway error: {}", error.message);
+                    eprintln!(
+                        "discord: gateway rejected the privileged Message Content Intent (4013); \
+                         reconnecting without it. Enable it on the bot in the Discord developer \
+                         portal to read server channel text; DMs keep working."
+                    );
+                    continue;
                 }
-                Reconnect::Resume => {
-                    eprintln!("discord gateway error: {}", error.message);
+                match error.reconnect {
+                    Reconnect::Fatal => {
+                        eprintln!("discord gateway stopped: {}", error.message);
+                        return;
+                    }
+                    Reconnect::Fresh => {
+                        session.clear();
+                        eprintln!("discord gateway error: {}", error.message);
+                    }
+                    Reconnect::Resume => {
+                        eprintln!("discord gateway error: {}", error.message);
+                    }
                 }
-            },
+            }
         }
         let wait = backoff.plan(jitter());
         eprintln!("discord: reconnecting in {:.1}s", wait.as_secs_f64());
@@ -341,8 +446,10 @@ async fn connect_loop(config: Config, agent_tx: mpsc::UnboundedSender<AgentComma
 async fn gateway_session(
     config: &Config,
     agent_tx: &mpsc::UnboundedSender<AgentCommand>,
+    router: &Router,
     session: &mut GatewaySession,
     backoff: &mut Backoff,
+    intents: u64,
 ) -> Gw<()> {
     let endpoint = session.endpoint();
     let want_resume = session.resumable();
@@ -380,7 +487,7 @@ async fn gateway_session(
             "op": 2,
             "d": {
                 "token": config.discord.bot_token,
-                "intents": INTENTS,
+                "intents": intents,
                 "properties": { "os": "linux", "browser": "rho", "device": "rho" },
             }
         });
@@ -435,7 +542,7 @@ async fn gateway_session(
                             GatewayOp::Dispatch
                                 if value["t"].as_str() == Some("MESSAGE_CREATE") =>
                             {
-                                route_message(&config.discord, &value["d"], agent_tx);
+                                route_message(&config.discord, &value["d"], agent_tx, router);
                             }
                             _ => continue,
                         }
@@ -499,6 +606,7 @@ fn route_message(
     config: &DiscordConfig,
     d: &Value,
     agent_tx: &mpsc::UnboundedSender<AgentCommand>,
+    router: &Router,
 ) {
     let channel_id = d["channel_id"].as_str().unwrap_or("");
     let relevant =
@@ -509,9 +617,17 @@ fn route_message(
     if !should_respond(&d["author"], channel_id, &config.allowed_user_id) {
         return;
     }
-    let content = d["content"].as_str().unwrap_or("").trim().to_string();
-    if !content.is_empty() {
-        let _ = agent_tx.send(AgentCommand::Prompt { text: content });
+    let content = d["content"].as_str().unwrap_or("").trim();
+    if content.is_empty() {
+        return;
+    }
+    if agent_tx
+        .send(AgentCommand::Prompt {
+            text: content.to_string(),
+        })
+        .is_ok()
+    {
+        router.expect_reply(channel_id);
     }
 }
 
@@ -532,10 +648,7 @@ fn close_error(
         Some(frame) => (u16::from(frame.code), frame.reason.to_string()),
         None => (0, String::new()),
     };
-    GatewayError::new(
-        format!("gateway closed ({code}) {reason}"),
-        reconnect_for_close(code),
-    )
+    GatewayError::closed(format!("gateway closed ({code}) {reason}"), code)
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(ws: &mut Ws) -> anyhow::Result<T> {
@@ -553,24 +666,36 @@ async fn read_json<T: serde::de::DeserializeOwned>(ws: &mut Ws) -> anyhow::Resul
     anyhow::bail!("gateway stream ended")
 }
 
-async fn reply_relay(mut events: broadcast::Receiver<AgentEvent>, outbox: mpsc::Sender<String>) {
+async fn reply_relay(
+    mut events: broadcast::Receiver<AgentEvent>,
+    outbox: mpsc::Sender<Posted>,
+    router: Arc<Router>,
+) {
     loop {
-        match events.recv().await {
-            Ok(AgentEvent::AssistantDone { text }) | Ok(AgentEvent::Error(text)) => {
-                let dropped = push_chunks(&outbox, &chunk_message(&text));
-                if dropped > 0 {
-                    eprintln!("discord: dropped {dropped} reply chunk(s), outbox full");
-                }
-            }
-            Ok(_) => {}
-            Err(broadcast::error::RecvError::Lagged(_)) => {}
+        let text = match events.recv().await {
+            Ok(AgentEvent::AssistantDone { text }) | Ok(AgentEvent::Error(text)) => text,
+            Ok(_) => continue,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
+        };
+        let Some(channel_id) = router.take() else {
+            continue;
+        };
+        let dropped = push_chunks(&outbox, &channel_id, &chunk_message(&text));
+        if dropped > 0 {
+            eprintln!("discord: dropped {dropped} reply chunk(s), outbox full");
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Posted {
+    pub channel_id: String,
+    pub text: String,
+}
+
 trait Poster {
-    async fn post(&self, text: &str) -> Result<(), (String, Retry)>;
+    async fn post(&self, channel_id: &str, text: &str) -> Result<(), (String, Retry)>;
 }
 
 #[derive(Debug, PartialEq)]
@@ -580,12 +705,17 @@ pub enum Delivery {
     GaveUp { attempts: u32, message: String },
 }
 
-async fn deliver<P: Poster + ?Sized>(post: &P, bucket: &mut Bucket, text: &str) -> Delivery {
+async fn deliver<P: Poster + ?Sized>(
+    post: &P,
+    bucket: &mut Bucket,
+    channel_id: &str,
+    text: &str,
+) -> Delivery {
     let mut attempts = 0;
     loop {
         bucket.acquire().await;
         attempts += 1;
-        match post.post(text).await {
+        match post.post(channel_id, text).await {
             Ok(()) => return Delivery::Sent,
             Err((message, Retry::Stop)) => return Delivery::Failed(message),
             Err((message, Retry::Wait(wait))) => {
@@ -601,11 +731,11 @@ async fn deliver<P: Poster + ?Sized>(post: &P, bucket: &mut Bucket, text: &str) 
 struct Outbox {
     poster: RestPoster,
     bucket: Bucket,
-    outbox: mpsc::Receiver<String>,
+    outbox: mpsc::Receiver<Posted>,
 }
 
 impl Outbox {
-    fn new(config: DiscordConfig, outbox: mpsc::Receiver<String>) -> Self {
+    fn new(config: DiscordConfig, outbox: mpsc::Receiver<Posted>) -> Self {
         Self {
             poster: RestPoster {
                 http: reqwest::Client::new(),
@@ -617,8 +747,15 @@ impl Outbox {
     }
 
     async fn run(mut self) {
-        while let Some(chunk) = self.outbox.recv().await {
-            match deliver(&self.poster, &mut self.bucket, &chunk).await {
+        while let Some(posted) = self.outbox.recv().await {
+            match deliver(
+                &self.poster,
+                &mut self.bucket,
+                &posted.channel_id,
+                &posted.text,
+            )
+            .await
+            {
                 Delivery::Sent => {}
                 Delivery::Failed(message) => eprintln!("discord send failed: {message}"),
                 Delivery::GaveUp { attempts, message } => {
@@ -646,13 +783,10 @@ pub fn auth_header(bot_token: &str) -> String {
 }
 
 impl Poster for RestPoster {
-    async fn post(&self, text: &str) -> Result<(), (String, Retry)> {
-        if self.config.channel_id.is_empty() {
-            return Ok(());
-        }
+    async fn post(&self, channel_id: &str, text: &str) -> Result<(), (String, Retry)> {
         let response = self
             .http
-            .post(send_url(&self.config.channel_id))
+            .post(send_url(channel_id))
             .header(
                 reqwest::header::AUTHORIZATION,
                 auth_header(&self.config.bot_token),
@@ -687,6 +821,8 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
     fn config(channel_id: &str) -> DiscordConfig {
         DiscordConfig {
@@ -878,13 +1014,21 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_drops_instead_of_blocking() {
-        let (tx, rx) = mpsc::channel(2);
+        let (tx, mut rx) = mpsc::channel(2);
         let chunks = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        assert_eq!(push_chunks(&tx, &chunks), 1);
+        assert_eq!(push_chunks(&tx, "9", &chunks), 1);
         assert_eq!(rx.len(), 2);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Posted {
+                channel_id: "9".to_string(),
+                text: "a".to_string()
+            }
+        );
+        assert_eq!(rx.len(), 1);
 
         drop(rx);
-        assert_eq!(push_chunks(&tx, &chunks), chunks.len());
+        assert_eq!(push_chunks(&tx, "9", &chunks), chunks.len());
     }
 
     struct ScriptedPoster {
@@ -909,7 +1053,7 @@ mod tests {
     }
 
     impl Poster for ScriptedPoster {
-        async fn post(&self, _text: &str) -> Result<(), (String, Retry)> {
+        async fn post(&self, _channel_id: &str, _text: &str) -> Result<(), (String, Retry)> {
             self.attempts.set(self.attempts.get() + 1);
             self.script
                 .borrow_mut()
@@ -926,7 +1070,10 @@ mod tests {
             Ok(()),
         ]);
         let mut bucket = Bucket::new(SENDS_PER_WINDOW, SEND_WINDOW);
-        assert_eq!(deliver(&poster, &mut bucket, "hi").await, Delivery::Sent);
+        assert_eq!(
+            deliver(&poster, &mut bucket, "9", "hi").await,
+            Delivery::Sent
+        );
         assert_eq!(poster.attempts.get(), 3);
     }
 
@@ -939,7 +1086,7 @@ mod tests {
         ]);
         let mut bucket = Bucket::new(SENDS_PER_WINDOW, SEND_WINDOW);
         assert_eq!(
-            deliver(&poster, &mut bucket, "hi").await,
+            deliver(&poster, &mut bucket, "9", "hi").await,
             Delivery::GaveUp {
                 attempts: MAX_SEND_ATTEMPTS,
                 message: "discord REST 429: slow down".to_string(),
@@ -956,7 +1103,7 @@ mod tests {
         ))]);
         let mut bucket = Bucket::new(SENDS_PER_WINDOW, SEND_WINDOW);
         assert_eq!(
-            deliver(&poster, &mut bucket, "hi").await,
+            deliver(&poster, &mut bucket, "9", "hi").await,
             Delivery::Failed("discord REST 403: missing permissions".to_string())
         );
         assert_eq!(poster.attempts.get(), 1);
@@ -968,7 +1115,10 @@ mod tests {
         let mut bucket = Bucket::new(2, Duration::from_secs(5));
         let start = tokio::time::Instant::now();
         for _ in 0..5 {
-            assert_eq!(deliver(&poster, &mut bucket, "hi").await, Delivery::Sent);
+            assert_eq!(
+                deliver(&poster, &mut bucket, "9", "hi").await,
+                Delivery::Sent
+            );
         }
         assert_eq!(poster.attempts.get(), 5);
         assert!(start.elapsed() >= Duration::from_secs(5));
@@ -987,24 +1137,25 @@ mod tests {
     #[test]
     fn routes_only_relevant_messages() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let router = Router::new("7");
         let message = json!({
             "channel_id": "9", "guild_id": "1", "content":  "  build it  ",
             "author": {"bot": false, "id": "42"}
         });
 
-        route_message(&config("9"), &message, &tx);
+        route_message(&config("9"), &message, &tx, &router);
         assert_eq!(
             rx.try_recv().unwrap().text_or_debug(),
             "build it".to_string()
         );
 
-        route_message(&config("7"), &message, &tx);
+        route_message(&config("7"), &message, &tx, &router);
         assert!(rx.try_recv().is_err());
 
         let dm = json!({
             "channel_id": "9", "content": "dm prompt", "author": {"bot": false, "id": "42"}
         });
-        route_message(&config("7"), &dm, &tx);
+        route_message(&config("7"), &dm, &tx, &router);
         assert_eq!(
             rx.try_recv().unwrap().text_or_debug(),
             "dm prompt".to_string()
@@ -1014,8 +1165,114 @@ mod tests {
             allowed_user_id: "1".to_string(),
             ..config("9")
         };
-        route_message(&restricted, &message, &tx);
+        route_message(&restricted, &message, &tx, &router);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn routed_messages_retarget_the_reply() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let router = Router::new("7");
+        let guild = json!({
+            "channel_id": "9", "guild_id": "1", "content": "build it",
+            "author": {"bot": false, "id": "42"}
+        });
+
+        assert_eq!(router.take().as_deref(), Some("7"));
+        route_message(&config("9"), &guild, &tx, &router);
+        assert_eq!(rx.try_recv().unwrap().text_or_debug(), "build it");
+        assert_eq!(router.take().as_deref(), Some("9"));
+
+        let dm = json!({
+            "channel_id": "77", "content": "hello", "author": {"bot": false, "id": "42"}
+        });
+        route_message(&config("9"), &dm, &tx, &router);
+        assert_eq!(rx.try_recv().unwrap().text_or_debug(), "hello");
+        assert_eq!(router.take().as_deref(), Some("77"));
+        assert_eq!(router.take().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn ignored_messages_do_not_claim_an_answer() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let router = Router::new("7");
+
+        let other_channel = json!({
+            "channel_id": "9", "guild_id": "1", "content": "nope",
+            "author": {"bot": false, "id": "42"}
+        });
+        route_message(&config("7"), &other_channel, &tx, &router);
+
+        let blank = json!({
+            "channel_id": "77", "guild_id": "1", "content": "",
+            "author": {"bot": false, "id": "42"}
+        });
+        route_message(&config("7"), &blank, &tx, &router);
+
+        let from_bot = json!({
+            "channel_id": "77", "guild_id": "1", "content": "echo",
+            "author": {"bot": true, "id": "42"}
+        });
+        route_message(&config("7"), &from_bot, &tx, &router);
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(router.take().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn answers_go_back_to_the_channel_that_asked() {
+        let router = Router::new("7");
+        assert_eq!(router.take().as_deref(), Some("7"));
+
+        router.expect_reply("9");
+        assert_eq!(router.take().as_deref(), Some("9"));
+        assert_eq!(router.take().as_deref(), Some("7"));
+
+        router.expect_reply("9");
+        router.expect_reply("99");
+        assert_eq!(router.take().as_deref(), Some("9"));
+        assert_eq!(router.take().as_deref(), Some("99"));
+        assert_eq!(router.take().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn without_a_configured_channel_only_discord_gets_answers() {
+        let router = Router::new("");
+        assert_eq!(router.take(), None);
+        router.expect_reply("9");
+        assert_eq!(router.take().as_deref(), Some("9"));
+        assert_eq!(router.take(), None);
+
+        router.expect_reply("   ");
+        assert_eq!(router.take(), None);
+    }
+
+    #[test]
+    fn identify_asks_for_the_message_content_intent() {
+        assert_eq!(INTENTS & GUILD_MESSAGE_CONTENT, GUILD_MESSAGE_CONTENT);
+        assert_eq!(INTENTS & DIRECT_MESSAGES, DIRECT_MESSAGES);
+        assert_eq!(INTENTS & GUILD_MESSAGES, GUILD_MESSAGES);
+    }
+
+    #[test]
+    fn disallowed_intents_drops_only_the_privileged_bit() {
+        let leaner = downgrade_intents(INTENTS, DISALLOWED_INTENTS);
+        assert_eq!(leaner, Some(INTENTS & !GUILD_MESSAGE_CONTENT));
+        assert_eq!(downgrade_intents(leaner.unwrap(), DISALLOWED_INTENTS), None);
+        assert_eq!(downgrade_intents(INTENTS, 4014), None);
+        assert_eq!(downgrade_intents(INTENTS, 0), None);
+    }
+
+    #[test]
+    fn close_errors_carry_the_code_that_decides_reconnect() {
+        let frame = CloseFrame {
+            code: CloseCode::from(DISALLOWED_INTENTS),
+            reason: "Disallowed intents".into(),
+        };
+        let error = close_error(Some(frame));
+        assert_eq!(error.close_code, DISALLOWED_INTENTS);
+        assert_eq!(error.reconnect, Reconnect::Fatal);
+        assert_eq!(close_error(None).close_code, 0);
     }
 
     impl AgentCommand {

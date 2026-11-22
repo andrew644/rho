@@ -182,21 +182,30 @@ loop:
 ### Discord remote control
 
 - Plain websocket + JSON against the Discord **gateway** (v10, intents
-  `GUILDS|GUILD_MESSAGES|DIRECT_MESSAGES` via `IDENTIFY`) — no heavy crate
-  dependency. `HELLO` sets the heartbeat period, the first beat is jittered,
-  an unacknowledged beat (`op 11` missing) drops the connection, `op 1`
-  requests an immediate beat, and `op 9` invalidates the session.
+  `GUILDS|GUILD_MESSAGE_CONTENT|GUILD_MESSAGES|DIRECT_MESSAGES` via `IDENTIFY`)
+  — no heavy crate dependency. `HELLO` sets the heartbeat period, the first
+  beat is jittered, an unacknowledged beat (`op 11` missing) drops the
+  connection, `op 1` requests an immediate beat, and `op 9` invalidates the
+  session.
+- `GUILD_MESSAGE_CONTENT` is privileged and must be switched on for the bot in
+  the developer portal; without it Discord sends server-channel
+  `MESSAGE_CREATE` with an empty `content`. A `4013 Disallowed intents` close
+  makes the bridge drop that one bit, warn and re-identify rather than stop,
+  so DMs keep working.
 - Reconnects send `RESUME` (`op 6`) with the `session_id`/`seq` and the
   `resume_gateway_url` handed out by `READY`; close codes decide the next
-  move: `4004/4010/4011/4013/4014` stop the bridge, `4007/4008/4009/4012`
+  move: `4004/4010/4011/4014` stop the bridge, `4007/4008/4009/4012`
   re-identify, anything else resumes. Wait between attempts doubles from 1 s
   to 60 s with jitter and resets once a session identifies.
 - Incoming `MESSAGE_CREATE` from the configured channel (or DM) from the
-  allowed user: text is enqueued as an agent prompt; agent replies
-  (final assistant text, split at 2000 chars) go to a bounded outbox drained
-  by a worker that POSTs `/channels/{id}/messages` with `Authorization: Bot
-  <token>` (Discord rejects `Bearer` for bot tokens with `401`) at 4 messages
-  per 5 s, so chunk bursts stay under Discord's per-channel limit.
+  allowed user: text is enqueued as an agent prompt and the channel becomes the
+  reply target, so answers go back where the question was asked; the
+  configured `channel_id` is the fallback for prompts with no Discord origin
+  (TUI, `rho -p`). Agent replies (final assistant text, split at 2000 chars)
+  go to a bounded outbox drained by a worker that POSTs
+  `/channels/{id}/messages` with `Authorization: Bot <token>` (Discord rejects
+  `Bearer` for bot tokens with `401`) at 4 messages per 5 s, so chunk bursts
+  stay under Discord's per-channel limit.
 - A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,
   5xx waits a second; up to 3 attempts per chunk. Other 4xx (bad token,
   missing permissions) are not retried. When the outbox is full the newest
