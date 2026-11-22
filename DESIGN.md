@@ -192,7 +192,7 @@ Improvements identified from a hands-on review of the running TUI.
 
 8. [x] **Busy-state input affordance** — dim the input border or show
    "queued" while the agent is running so it's clear what Enter will do.
-9. [ ] **Slash-command autocomplete** — typing `/` + Tab (or arrows) filters
+9. [x] **Slash-command autocomplete** — typing `/` + Tab (or arrows) filters
    and completes built-in commands and template names.
 10. [x] **Multiline input** — Shift+Enter / Ctrl+J insert a newline instead of
     submitting, so pasted multi-line prompts don't fire early.

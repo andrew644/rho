@@ -192,6 +192,11 @@ fn assistant_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+const BUILTIN_COMMANDS: [&str; 11] = [
+    "compact", "exit", "help", "loop", "model", "name", "new", "quit", "resume", "session",
+    "stop",
+];
+
 fn fmt_tokens(n: usize) -> String {
     let (v, unit) = if n >= 1_000_000 {
         (n as f64 / 1_000_000.0, 'M')
@@ -311,6 +316,7 @@ pub struct App {
     status: String,
     spinner_frame: usize,
     turn_start: Option<Instant>,
+    completion: Option<(Vec<String>, usize)>,
     loop_status: Option<String>,
     busy: bool,
     current_tool: Option<String>,
@@ -355,6 +361,7 @@ impl App {
             status: "idle".to_string(),
             spinner_frame: 0,
             turn_start: None,
+            completion: None,
             loop_status: None,
             busy: false,
             current_tool: None,
@@ -376,6 +383,55 @@ impl App {
 
     fn template_names(&self) -> Vec<String> {
         self.templates.iter().map(|t| t.name.clone()).collect()
+    }
+
+    fn command_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = BUILTIN_COMMANDS.iter().map(|n| n.to_string()).collect();
+        names.extend(self.template_names());
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn complete_input(&mut self, back: bool) {
+        if let Some((m, i)) = self.completion.clone() {
+            if self.input == format!("/{}", m[i]) {
+                let idx = if back {
+                    (i + m.len() - 1) % m.len()
+                } else {
+                    (i + 1) % m.len()
+                };
+                self.input = format!("/{}", m[idx]);
+                self.cursor = self.input.chars().count();
+                self.completion = Some((m, idx));
+                return;
+            }
+        }
+        let nchars = self.input.chars().count();
+        if !self.input.starts_with('/') || self.cursor != nchars {
+            return;
+        }
+        let prefix: String = self.input.chars().skip(1).collect();
+        if prefix.contains(char::is_whitespace) {
+            return;
+        }
+        let matches: Vec<String> = self
+            .command_names()
+            .into_iter()
+            .filter(|n| n.starts_with(&prefix))
+            .collect();
+        if matches.is_empty() {
+            self.completion = None;
+            return;
+        }
+        if matches.len() == 1 {
+            self.input = format!("/{} ", matches[0]);
+            self.completion = None;
+        } else {
+            self.input = format!("/{}", matches[0]);
+            self.completion = Some((matches, 0));
+        }
+        self.cursor = self.input.chars().count();
     }
 
     fn push(&mut self, text: impl Into<String>, kind: Kind) {
@@ -527,7 +583,18 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return false;
         }
+        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.completion = None;
+        }
         match key.code {
+            KeyCode::Tab => {
+                self.complete_input(false);
+                false
+            }
+            KeyCode::BackTab => {
+                self.complete_input(true);
+                false
+            }
             KeyCode::Esc => {
                 cancel.store(true, Ordering::SeqCst);
                 self.push("interrupt requested", Kind::Info);
@@ -1391,6 +1458,69 @@ mod tests {
         app.insert_text("a\r\nb\rc");
         assert_eq!(app.input, "a\nb\nc");
         assert_eq!(app.cursor, 5);
+    }
+
+    #[test]
+    fn tab_completes_unique_prefix_with_space() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "/res".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
+        }
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        assert_eq!(app.input, "/resume ");
+        assert_eq!(app.cursor, 8);
+    }
+
+    #[test]
+    fn tab_cycles_when_ambiguous_and_backtab_reverses() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('/')), &tx, &cancel);
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        let first = app.input.clone();
+        assert!(first.starts_with('/') && !first.contains(' '), "{first}");
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        assert_ne!(app.input, first);
+        app.handle_key(key(KeyCode::BackTab), &tx, &cancel);
+        assert_eq!(app.input, first);
+    }
+
+    #[test]
+    fn tab_completes_template_names() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        app.templates.push(Template {
+            name: "greet".into(),
+            description: String::new(),
+            argument_hint: None,
+            body: "hello".into(),
+        });
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "/gr".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
+        }
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        assert_eq!(app.input, "/greet ");
+    }
+
+    #[test]
+    fn editing_resets_completion_cycle() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('/')), &tx, &cancel);
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        let first = app.input.clone();
+        app.handle_key(key(KeyCode::Char('c')), &tx, &cancel);
+        assert!(app.input.starts_with(&first));
+        assert!(app.completion.is_none() || app.input.contains(' '));
     }
 
     #[test]
