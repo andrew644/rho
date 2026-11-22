@@ -5,13 +5,14 @@ pub const KEEP_RECENT_TOKENS: usize = 20_000;
 
 pub fn estimate_message_tokens(message: &Message) -> usize {
     let content = message.content.as_deref().unwrap_or("").len();
+    let reasoning = message.reasoning.as_deref().unwrap_or("").len();
     let calls = message
         .tool_calls
         .iter()
         .flatten()
         .map(|c| c.function.name.len() + c.function.arguments.len() + c.id.len())
         .sum::<usize>();
-    (content + calls).div_ceil(4)
+    (content + reasoning + calls).div_ceil(4)
 }
 
 pub fn estimate_tokens(messages: &[Message]) -> usize {
@@ -164,9 +165,28 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning: None,
         };
         assert!(estimate_message_tokens(&with_calls) > 2);
         assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn reasoning_counts_toward_estimated_tokens() {
+        let m = Message::assistant("abcd");
+        let plain = estimate_message_tokens(&m);
+        let mut with_reasoning = Message::assistant("abcd");
+        with_reasoning.reasoning = Some("x".repeat(400));
+        assert!(estimate_message_tokens(&with_reasoning) > plain);
+    }
+
+    #[test]
+    fn summaries_omit_thinking_text() {
+        let mut m = Message::assistant("visible answer");
+        m.reasoning = Some("inner thoughts".to_string());
+        let text = serialize_conversation(&[m]);
+        assert!(text.contains("visible answer"));
+        assert!(!text.contains("inner thoughts"));
     }
 
     #[test]
@@ -204,12 +224,14 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning: None,
         });
         m.push(Message {
             role: "tool".into(),
             content: Some("result".into()),
             tool_calls: None,
             tool_call_id: Some("c1".into()),
+            reasoning: None,
         });
         m.push(big_message("user", 9_000));
         let cut = find_cut_point(&m, 10_000).unwrap();
@@ -268,6 +290,7 @@ mod tests {
                 content: Some(format!("result {i}")),
                 tool_calls: None,
                 tool_call_id: Some(format!("c{i}")),
+                reasoning: None,
             });
         }
         let cut = find_cut_point(&m, 5_000).unwrap();
@@ -290,6 +313,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning: None,
         });
         m.push(Message::tool_result("c1", "x".repeat(30_000)));
         m.push(Message::assistant("done"));

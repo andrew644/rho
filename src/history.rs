@@ -95,7 +95,16 @@ mod tests {
             content: None,
             tool_calls: Some(ids.iter().map(|id| tool_call(id)).collect()),
             tool_call_id: None,
+            reasoning: None,
         }
+    }
+
+    #[test]
+    fn sanitizing_preserves_reasoning() {
+        let mut a = Message::assistant("done");
+        a.reasoning = Some("thought".to_string());
+        let fixed = sanitize_history(&[Message::user("hi"), a]);
+        assert_eq!(fixed[1].reasoning.as_deref(), Some("thought"));
     }
 
     #[test]
@@ -105,6 +114,7 @@ mod tests {
             content: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         };
         let fixed = sanitize_history(&[Message::user("hi"), broken]);
         assert_eq!(fixed[1].content.as_deref(), Some(""));

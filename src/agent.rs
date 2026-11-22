@@ -488,6 +488,8 @@ impl Agent {
                         },
                         tool_calls: Some(assistant.tool_calls.clone()),
                         tool_call_id: None,
+                        reasoning: (!assistant.reasoning.is_empty())
+                            .then(|| assistant.reasoning.clone()),
                     });
                     self.send_usage(events);
                     for call in &assistant.tool_calls {
@@ -539,6 +541,7 @@ impl Agent {
                     Some(assistant.tool_calls.clone())
                 },
                 tool_call_id: None,
+                reasoning: (!assistant.reasoning.is_empty()).then(|| assistant.reasoning.clone()),
             };
             if message.content.is_none() && message.tool_calls.is_none() {
                 message.content = Some(String::new());

@@ -27,6 +27,12 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(
+        default,
+        rename = "reasoning_content",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning: Option<String>,
 }
 
 impl Message {
@@ -48,6 +54,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            reasoning: None,
         }
     }
 
@@ -57,6 +64,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }
     }
 }
@@ -90,4 +98,35 @@ pub struct AssistantMessage {
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
     pub usage: Usage,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_serializes_as_reasoning_content_when_present() {
+        let mut m = Message::assistant("answer");
+        m.reasoning = Some("thinking".to_string());
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["reasoning_content"], "thinking");
+        assert!(json.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn reasoning_round_trips_and_is_omitted_when_absent() {
+        let m: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "a",
+            "reasoning_content": "t"
+        }))
+        .unwrap();
+        assert_eq!(m.reasoning.as_deref(), Some("t"));
+        let without: Message =
+            serde_json::from_value(serde_json::json!({"role": "user", "content": "u"})).unwrap();
+        assert!(without.reasoning.is_none());
+        assert!(!serde_json::to_string(&without)
+            .unwrap()
+            .contains("reasoning"));
+    }
 }
