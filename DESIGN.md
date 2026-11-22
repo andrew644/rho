@@ -199,7 +199,7 @@ Improvements identified from a hands-on review of the running TUI.
 
 ### Robustness / theming
 
-11. [ ] **Configurable theme** — yellow tool lines and dark-gray reasoning are
+11. [x] **Configurable theme** — yellow tool lines and dark-gray reasoning are
     unreadable on light terminals; add a palette/theme section to config
     (at least dark/light/ansi variants).
 12. [ ] **Rich welcome screen** — first frame should show version, model,

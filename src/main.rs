@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         known_models: known,
         templates: loaded_templates,
         context_window: config.context_window,
+        theme: config.theme,
     };
     rho::tui::run(agent_tx, cancel, event_rx, tui).await
 }

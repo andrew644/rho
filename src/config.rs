@@ -85,12 +85,23 @@ impl Default for CompactionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeName {
+    #[default]
+    Dark,
+    Light,
+    Ansi,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Config {
     pub provider: ProviderConfig,
     pub model: ModelConfig,
     #[serde(default = "default_context_window")]
     pub context_window: u32,
+    #[serde(default)]
+    pub theme: ThemeName,
     #[serde(default)]
     pub discord: DiscordConfig,
     #[serde(default)]
@@ -161,6 +172,7 @@ compaction:
         assert_eq!(cfg.model.id, "qwen4exp");
         assert_eq!(cfg.model.max_tokens, 2048);
         assert_eq!(cfg.context_window, 100000);
+        assert_eq!(cfg.theme, ThemeName::Dark);
         assert!(cfg.discord.enabled);
         assert_eq!(cfg.discord.channel_id, "123");
         assert_eq!(cfg.loop_config.max_turns_per_run, 10);
@@ -183,12 +195,29 @@ model:
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.model.max_tokens, 4096);
         assert_eq!(cfg.context_window, 200000);
+        assert_eq!(cfg.theme, ThemeName::Dark);
         assert!(!cfg.discord.enabled);
         assert_eq!(cfg.loop_config.max_turns_per_run, 64);
         assert!(cfg.compaction.enabled);
         assert_eq!(cfg.compaction.reserve_tokens, 16_384);
         assert_eq!(cfg.compaction.keep_recent_tokens, 20_000);
         assert!(cfg.model.models.is_empty());
+    }
+
+    #[test]
+    fn parses_theme() {
+        let yaml = r#"
+provider:
+  base_url: http://localhost:8000/v1
+model:
+  id: test-model
+theme: light
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.theme, ThemeName::Light);
     }
 
     #[test]

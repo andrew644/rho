@@ -17,6 +17,7 @@ use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{AgentCommand, AgentEvent};
+use crate::config::ThemeName;
 use crate::loops::parse_loop_spec;
 use crate::session::{self, SessionInfo};
 use crate::templates::{self, Template};
@@ -151,22 +152,77 @@ fn kind_prefix(kind: Kind) -> &'static str {
     }
 }
 
-fn kind_style(kind: Kind) -> Style {
-    match kind {
-        Kind::User => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        Kind::Assistant => Style::default(),
-        Kind::Reasoning => Style::default().fg(Color::DarkGray),
-        Kind::Tool => Style::default().fg(Color::Yellow),
-        Kind::Error => Style::default().fg(Color::Red),
-        Kind::Info => Style::default().fg(Color::Green),
+fn kind_style(theme: &Theme, kind: Kind) -> Style {
+    match theme.name {
+        ThemeName::Dark => match kind {
+            Kind::User => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Kind::Assistant => Style::default(),
+            Kind::Reasoning => Style::default().fg(Color::DarkGray),
+            Kind::Tool => Style::default().fg(Color::Yellow),
+            Kind::Error => Style::default().fg(Color::Red),
+            Kind::Info => Style::default().fg(Color::Green),
+        },
+        ThemeName::Light => match kind {
+            Kind::User => Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            Kind::Assistant => Style::default().fg(Color::Black),
+            Kind::Reasoning => Style::default().fg(Color::Blue),
+            Kind::Tool => Style::default().fg(Color::Magenta),
+            Kind::Error => Style::default().fg(Color::Red),
+            Kind::Info => Style::default().fg(Color::Green),
+        },
+        ThemeName::Ansi => match kind {
+            Kind::User => Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            Kind::Assistant => Style::default(),
+            Kind::Reasoning => Style::default().fg(Color::Magenta),
+            Kind::Tool => Style::default().fg(Color::Yellow),
+            Kind::Error => Style::default().fg(Color::Red),
+            Kind::Info => Style::default().fg(Color::Green),
+        },
     }
 }
 
-fn assistant_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    let style = kind_style(Kind::Assistant);
-    let code_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+#[derive(Clone)]
+pub struct Theme {
+    name: ThemeName,
+}
+
+impl Theme {
+    pub fn new(name: ThemeName) -> Self {
+        Self { name }
+    }
+
+    fn output_style(&self) -> Style {
+        match self.name {
+            ThemeName::Light => Style::default().fg(Color::Black),
+            _ => Style::default().fg(Color::DarkGray),
+        }
+    }
+
+    fn code_style(&self) -> Style {
+        match self.name {
+            ThemeName::Dark => Style::default().fg(Color::White).bg(Color::DarkGray),
+            ThemeName::Light => Style::default().fg(Color::Black).bg(Color::DarkGray),
+            ThemeName::Ansi => Style::default().add_modifier(Modifier::UNDERLINED),
+        }
+    }
+
+    fn busy_border_color(&self) -> Color {
+        match self.name {
+            ThemeName::Light => Color::Black,
+            _ => Color::DarkGray,
+        }
+    }
+}
+
+fn assistant_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let style = kind_style(theme, Kind::Assistant);
+    let code_style = theme.code_style();
     let mut lines = Vec::new();
     let mut in_fence = false;
     let src_lines: Vec<&str> = if text.is_empty() { vec![""] } else { text.lines().collect() };
@@ -243,11 +299,16 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn entry_lines(entry: &Entry, width: usize, expand_tools: bool) -> Vec<Line<'static>> {
+fn entry_lines(
+    entry: &Entry,
+    width: usize,
+    expand_tools: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if entry.kind == Kind::Assistant {
-        return assistant_lines(&entry.text, width);
+        return assistant_lines(&entry.text, width, theme);
     }
-    let style = kind_style(entry.kind);
+    let style = kind_style(theme, entry.kind);
     let prefix = kind_prefix(entry.kind);
     let indent = prefix.chars().count();
     let avail = width.saturating_sub(indent).max(1);
@@ -288,14 +349,14 @@ fn entry_lines(entry: &Entry, width: usize, expand_tools: bool) -> Vec<Line<'sta
             for w in wrapped {
                 lines.push(Line::from(Span::styled(
                     format!("{out_indent}{w}"),
-                    Style::default().fg(Color::DarkGray),
+                    theme.output_style(),
                 )));
             }
         }
         if limit < out_lines.len() {
             lines.push(Line::from(Span::styled(
                 format!("  … +{} lines (Ctrl+O to expand)", out_lines.len() - limit),
-                Style::default().fg(Color::DarkGray),
+                theme.output_style(),
             )));
         }
     }
@@ -325,6 +386,7 @@ pub struct App {
     last_rendered_lines: usize,
     cwd: PathBuf,
     model: String,
+    theme: Theme,
     context_window: u32,
     known_models: Vec<String>,
     templates: Vec<Template>,
@@ -342,6 +404,7 @@ impl App {
         known_models: Vec<String>,
         templates: Vec<Template>,
         context_window: u32,
+        theme: Theme,
     ) -> Self {
         Self {
             entries: vec![Entry {
@@ -370,6 +433,7 @@ impl App {
             last_rendered_lines: 0,
             cwd,
             model,
+            theme,
             context_window,
             known_models,
             templates,
@@ -1022,7 +1086,7 @@ impl App {
                 lines.push(Line::from(""));
             }
             prev_kind = Some(entry.kind);
-            lines.extend(entry_lines(entry, width, self.expand_tools));
+            lines.extend(entry_lines(entry, width, self.expand_tools, &self.theme));
         };
         for entry in &self.entries {
             append(entry, &mut lines);
@@ -1071,7 +1135,7 @@ impl App {
             ));
         }
         let border_style = if self.busy {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.theme.busy_border_color())
         } else {
             Style::default()
         };
@@ -1118,6 +1182,7 @@ pub struct TuiOptions {
     pub known_models: Vec<String>,
     pub templates: Vec<Template>,
     pub context_window: u32,
+    pub theme: ThemeName,
 }
 
 async fn run_inner(
@@ -1133,6 +1198,7 @@ async fn run_inner(
         opts.known_models,
         opts.templates,
         opts.context_window,
+        Theme::new(opts.theme),
     );
     let mut keys = crossterm::event::EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
@@ -1181,6 +1247,7 @@ mod tests {
             vec!["test-model".into()],
             vec![],
             128_000,
+            Theme::new(ThemeName::Dark),
         )
     }
 
@@ -1277,6 +1344,7 @@ mod tests {
                 body: "hello $1".into(),
             }],
             128_000,
+            Theme::new(ThemeName::Dark),
         );
         app.on_submit("/greet world", &tx);
         match rx.try_recv().unwrap() {
@@ -1366,7 +1434,7 @@ mod tests {
             output: (1..=50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
         });
         let entry = app.entries.iter().find(|e| e.kind == Kind::Tool).unwrap();
-        let lines = entry_lines(entry, 80, false);
+        let lines = entry_lines(entry, 80, false, &Theme::new(ThemeName::Dark));
         assert_eq!(lines.len(), TOOL_OUTPUT_LINES + 2, "header + 20 lines + note");
         let texts: Vec<String> = lines
             .iter()
@@ -1374,7 +1442,7 @@ mod tests {
             .collect();
         assert_eq!(texts[1], "  line 1");
         assert!(texts[21].contains("+30 lines (Ctrl+O to expand)"), "{texts:#?}");
-        let expanded = entry_lines(entry, 80, true);
+        let expanded = entry_lines(entry, 80, true, &Theme::new(ThemeName::Dark));
         assert_eq!(expanded.len(), 51);
     }
 
@@ -1544,7 +1612,8 @@ mod tests {
 
 #[cfg(test)]
 mod wrap_tests {
-    use super::{entry_lines, wrap_words, Entry, Kind};
+    use super::{entry_lines, wrap_words, Entry, Kind, Theme};
+    use crate::config::ThemeName;
     use std::path::PathBuf;
 
     #[test]
@@ -1571,7 +1640,7 @@ mod wrap_tests {
             kind: Kind::User,
             output: None,
         };
-        let lines = entry_lines(&entry, 13, false);
+        let lines = entry_lines(&entry, 13, false, &Theme::new(ThemeName::Dark));
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1581,12 +1650,12 @@ mod wrap_tests {
 
     #[test]
     fn reasoning_entry_renders_as_one_block() {
-        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![], 128_000);
+        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![], 128_000, Theme::new(ThemeName::Dark));
         app.on_event(super::AgentEvent::ReasoningDelta("line one\n".into()));
         app.on_event(super::AgentEvent::ReasoningDelta("line two".into()));
         let pending = app.pending.as_ref().unwrap();
         assert_eq!(pending.text, "line one\nline two");
-        assert_eq!(entry_lines(pending, 40, false).len(), 2);
+        assert_eq!(entry_lines(pending, 40, false, &Theme::new(ThemeName::Dark)).len(), 2);
     }
 
     fn assistant(text: &str) -> Entry {
@@ -1607,7 +1676,7 @@ mod wrap_tests {
     #[test]
     fn code_fences_render_indented_without_backticks() {
         let entry = assistant("before\n```rust\nfn main() {}\n```\nafter");
-        let lines: Vec<String> = entry_lines(&entry, 60, false)
+        let lines: Vec<String> = entry_lines(&entry, 60, false, &Theme::new(ThemeName::Dark))
             .iter()
             .map(line_text)
             .collect();
@@ -1621,7 +1690,7 @@ mod wrap_tests {
     fn code_fences_are_not_reflowed() {
         let long = "x".repeat(120);
         let entry = assistant(&format!("```\n{long}\n```"));
-        let lines: Vec<String> = entry_lines(&entry, 40, false)
+        let lines: Vec<String> = entry_lines(&entry, 40, false, &Theme::new(ThemeName::Dark))
             .iter()
             .map(line_text)
             .collect();
@@ -1631,7 +1700,7 @@ mod wrap_tests {
     #[test]
     fn prose_outside_fences_still_wraps() {
         let entry = assistant("```\ncode\n```\nword word word word word");
-        let lines: Vec<String> = entry_lines(&entry, 10, false)
+        let lines: Vec<String> = entry_lines(&entry, 10, false, &Theme::new(ThemeName::Dark))
             .iter()
             .map(line_text)
             .collect();
@@ -1654,6 +1723,7 @@ mod draw_tests {
             vec!["test-model".into()],
             vec![],
             128_000,
+            Theme::new(ThemeName::Dark),
         )
     }
 
@@ -1718,6 +1788,7 @@ mod scroll_tests {
             vec!["test-model".into()],
             vec![],
             128_000,
+            Theme::new(ThemeName::Dark),
         )
     }
 
@@ -1736,7 +1807,7 @@ mod scroll_tests {
 
     #[test]
     fn pages_vertically_not_horizontally() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1776,7 +1847,7 @@ mod scroll_tests {
 
     #[test]
     fn scrolled_view_survives_streaming_output() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1810,7 +1881,7 @@ mod scroll_tests {
 
     #[test]
     fn wheel_scroll_detaches_and_reattaches_follow() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         assert!(app.follow);
         app.scroll_by(3);
         assert!(!app.follow);
@@ -1834,7 +1905,7 @@ mod scroll_tests {
 
     #[test]
     fn scrollbar_appears_on_overflow_and_follows_scroll() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1850,7 +1921,7 @@ mod scroll_tests {
 
     #[test]
     fn no_scrollbar_when_content_fits() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         app.push("short message".to_string(), Kind::User);
         let screen = render(&mut app, 80, 24);
         let col = right_column(&screen);
@@ -1858,6 +1929,24 @@ mod scroll_tests {
             col.chars().all(|c| c == ' '),
             "no scrollbar expected, got: {col:?}"
         );
+    }
+
+    #[test]
+    fn themes_produce_distinct_readable_palettes() {
+        let dark = Theme::new(ThemeName::Dark);
+        let light = Theme::new(ThemeName::Light);
+        let ansi = Theme::new(ThemeName::Ansi);
+        assert_eq!(kind_style(&dark, Kind::Reasoning).fg, Some(Color::DarkGray));
+        assert_eq!(kind_style(&light, Kind::Reasoning).fg, Some(Color::Blue));
+        assert_eq!(kind_style(&ansi, Kind::Tool).fg, Some(Color::Yellow));
+        assert_eq!(kind_style(&ansi, Kind::User).fg, Some(Color::Blue));
+        assert_eq!(dark.code_style().bg, Some(Color::DarkGray));
+        assert_eq!(ansi.code_style().bg, None);
+        assert!(ansi
+            .code_style()
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
+        assert_eq!(light.output_style().fg, Some(Color::Black));
     }
 
     #[test]
@@ -1914,7 +2003,7 @@ mod scroll_tests {
 
     #[test]
     fn long_lines_wrap_within_width() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         app.push("x".repeat(500), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
         for row in &screen {
@@ -1928,7 +2017,7 @@ mod scroll_tests {
 
     #[test]
     fn different_kinds_are_separated_by_blank_line() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         app.push("hello there".to_string(), Kind::User);
         app.push("a response".to_string(), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
@@ -1940,7 +2029,7 @@ mod scroll_tests {
 
     #[test]
     fn ctrl_r_toggles_reasoning_visibility() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
         app.push("because reasons".to_string(), Kind::Reasoning);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
