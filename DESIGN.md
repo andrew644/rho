@@ -72,7 +72,9 @@ system prompt for the current working directory.
 ### /pwd
 
 `/pwd [path]` prints or changes the working directory. Relative paths resolve
-against the current pwd. Changing it rebuilds the tools (so `read`/`bash`/
+against the current pwd. While typing the argument, Tab/Shift-Tab complete
+directory names (unique matches complete and continue into the directory,
+ambiguous matches cycle; `~` expands to home). Changing it rebuilds the tools (so `read`/`bash`/
 `edit`/`write` resolve relative paths against the new pwd), rebuilds the
 system prompt for the new directory (including its `AGENTS.md`), notifies the
 model, and redirects subsequent `!` / `!!` shell commands.

@@ -49,7 +49,9 @@ cargo run
   Home/End scroll the transcript (a scrollbar shows the viewport). Up/Down walk
   prompt history. Ctrl+C or `/quit` exits.
 - Ctrl+R toggles the reasoning block. Tab / Shift-Tab complete slash commands
-  and template names. Shift+Enter or Ctrl+J insert newlines in the input
+  and template names; after `/pwd ` they also complete directory paths
+  (bash-style: unique matches complete and descend, ambiguous matches cycle;
+  `~` expands to home; dotfiles appear once you type `.`). Shift+Enter or Ctrl+J insert newlines in the input
   (pasted multiline text is never submitted early); Enter submits.
 - Tools: `read`, `bash`, `edit`, `write` (same semantics as pi).
 - `!cmd` runs a shell command and shares its output with the model;

@@ -255,6 +255,19 @@ const BUILTIN_COMMANDS: [&str; 12] = [
     "session", "stop",
 ];
 
+fn expand_home(token: &str) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return token.to_string();
+    };
+    if token == "~" {
+        home.display().to_string()
+    } else if let Some(rest) = token.strip_prefix("~/") {
+        format!("{}/{}", home.display(), rest)
+    } else {
+        token.to_string()
+    }
+}
+
 fn fmt_tokens(n: usize) -> String {
     let (v, unit) = if n >= 1_000_000 {
         (n as f64 / 1_000_000.0, 'M')
@@ -469,13 +482,13 @@ impl App {
 
     fn complete_input(&mut self, back: bool) {
         if let Some((m, i)) = self.completion.clone() {
-            if self.input == format!("/{}", m[i]) {
+            if m.len() > 1 && self.input == m[i] {
                 let idx = if back {
                     (i + m.len() - 1) % m.len()
                 } else {
                     (i + 1) % m.len()
                 };
-                self.input = format!("/{}", m[idx]);
+                self.input = m[idx].clone();
                 self.cursor = self.input.chars().count();
                 self.completion = Some((m, idx));
                 return;
@@ -483,6 +496,13 @@ impl App {
         }
         let nchars = self.input.chars().count();
         if !self.input.starts_with('/') || self.cursor != nchars {
+            return;
+        }
+        if let Some(rest) = self.input.strip_prefix("/pwd ").map(|s| s.to_string()) {
+            let token = rest.trim_start().to_string();
+            if !token.contains(char::is_whitespace) {
+                self.complete_path(&token);
+            }
             return;
         }
         let prefix: String = self.input.chars().skip(1).collect();
@@ -502,9 +522,48 @@ impl App {
             self.input = format!("/{} ", matches[0]);
             self.completion = None;
         } else {
-            self.input = format!("/{}", matches[0]);
-            self.completion = Some((matches, 0));
+            let cands: Vec<String> = matches.iter().map(|n| format!("/{n}")).collect();
+            self.input = cands[0].clone();
+            self.completion = Some((cands, 0));
         }
+        self.cursor = self.input.chars().count();
+    }
+
+    fn complete_path(&mut self, token: &str) {
+        let token = expand_home(token);
+        let (parent, base) = match token.rfind('/') {
+            Some(i) => (&token[..=i], &token[i + 1..]),
+            None => ("", token.as_str()),
+        };
+        let dir = self.pwd.join(parent);
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        name.starts_with(base)
+                            && (base.starts_with('.') || !name.starts_with('.'))
+                            && e.path().is_dir()
+                    })
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if names.is_empty() {
+            self.completion = None;
+            return;
+        }
+        names.sort();
+        let cands: Vec<String> = names
+            .iter()
+            .map(|n| format!("/pwd {parent}{n}/"))
+            .collect();
+        self.input = cands[0].clone();
+        self.completion = if cands.len() == 1 {
+            None
+        } else {
+            Some((cands, 0))
+        };
         self.cursor = self.input.chars().count();
     }
 
@@ -1552,6 +1611,46 @@ mod tests {
         app.insert_text("a\r\nb\rc");
         assert_eq!(app.input, "a\nb\nc");
         assert_eq!(app.cursor, 5);
+    }
+
+    #[test]
+    fn tab_completes_directories_for_pwd_argument() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("scripts")).unwrap();
+        std::fs::create_dir(d.path().join("src")).unwrap();
+        std::fs::create_dir(d.path().join("src").join("main")).unwrap();
+        std::fs::write(d.path().join("scripts.md"), "not a dir").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = test_app();
+        app.pwd = d.path().to_path_buf();
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "/pwd s".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
+        }
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        assert_eq!(app.input, "/pwd scripts/");
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        assert_eq!(app.input, "/pwd src/");
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        assert_eq!(app.input, "/pwd scripts/");
+        app.completion = None;
+        app.input = "/pwd src/".to_string();
+        app.cursor = 9;
+        app.handle_key(key(KeyCode::Tab), &tx, &cancel);
+        assert_eq!(app.input, "/pwd src/main/");
+        assert_eq!(app.cursor, app.input.chars().count());
+    }
+
+    #[test]
+    fn pwd_submission_sends_completed_path() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.on_submit("/pwd src/main/", &tx);
+        match rx.try_recv().unwrap() {
+            AgentCommand::SetPwd { path } => assert_eq!(path, PathBuf::from("src/main/")),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
