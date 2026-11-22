@@ -175,7 +175,7 @@ Improvements identified from a hands-on review of the running TUI.
 3. [ ] **Markdown / code rendering** — assistant output shows raw backticks and
    fences; detect code fences (indent + dim background, no reflow) at minimum,
    ideally syntax highlighting.
-4. [ ] **Tool output presentation** — replace per-line `# ` prefixes with a
+4. [x] **Tool output presentation** — replace per-line `# ` prefixes with a
    single header line (`read Cargo.toml:3 ✓`) followed by 2-column-indented
    output, capped at N lines with an "… +N lines (expand)" note.
 

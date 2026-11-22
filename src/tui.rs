@@ -104,6 +104,29 @@ pub fn classify_input(input: &str, template_names: &[String]) -> Option<InputAct
 struct Entry {
     text: String,
     kind: Kind,
+    output: Option<String>,
+}
+
+const TOOL_OUTPUT_LINES: usize = 20;
+
+fn summarize_args(args: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(args).ok();
+    let values = parsed.as_ref().and_then(|v| v.as_object());
+    let summary = match values {
+        Some(map) => ["path", "command"]
+            .iter()
+            .find_map(|k| map.get(*k).and_then(|v| v.as_str()))
+            .or_else(|| map.values().find_map(|v| v.as_str()))
+            .unwrap_or(args)
+            .to_string(),
+        None => args.to_string(),
+    };
+    let first_line = summary.lines().next().unwrap_or("");
+    let mut short: String = first_line.chars().take(60).collect();
+    if first_line.chars().count() > 60 {
+        short.push('…');
+    }
+    short
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -171,7 +194,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
+fn entry_lines(entry: &Entry, width: usize, expand_tools: bool) -> Vec<Line<'static>> {
     let style = kind_style(entry.kind);
     let prefix = kind_prefix(entry.kind);
     let indent = prefix.chars().count();
@@ -196,6 +219,34 @@ fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(text, style)));
         }
     }
+    if let Some(output) = &entry.output {
+        let out_indent = "  ";
+        let out_avail = width.saturating_sub(out_indent.chars().count()).max(1);
+        let out_lines: Vec<&str> = output.lines().collect();
+        let limit = if expand_tools {
+            out_lines.len()
+        } else {
+            out_lines.len().min(TOOL_OUTPUT_LINES)
+        };
+        for src in out_lines.iter().take(limit) {
+            let mut wrapped = wrap_words(src, out_avail);
+            if wrapped.is_empty() {
+                wrapped.push(String::new());
+            }
+            for w in wrapped {
+                lines.push(Line::from(Span::styled(
+                    format!("{out_indent}{w}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        if limit < out_lines.len() {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{} lines (Ctrl+O to expand)", out_lines.len() - limit),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
     lines
 }
 
@@ -208,6 +259,8 @@ pub struct App {
     history_index: Option<usize>,
     scroll_from_bottom: usize,
     show_reasoning: bool,
+    expand_tools: bool,
+    pending_tool: Option<usize>,
     status: String,
     loop_status: Option<String>,
     busy: bool,
@@ -237,6 +290,7 @@ impl App {
             entries: vec![Entry {
                 text: "rho — type a prompt, /help for commands".to_string(),
                 kind: Kind::Info,
+                output: None,
             }],
             pending: None,
             input: String::new(),
@@ -245,6 +299,8 @@ impl App {
             history_index: None,
             scroll_from_bottom: 0,
             show_reasoning: true,
+            expand_tools: false,
+            pending_tool: None,
             status: "idle".to_string(),
             loop_status: None,
             busy: false,
@@ -273,6 +329,7 @@ impl App {
         self.entries.push(Entry {
             text: text.into(),
             kind,
+            output: None,
         });
         if self.follow {
             self.scroll_from_bottom = 0;
@@ -295,6 +352,7 @@ impl App {
                 self.pending = Some(Entry {
                     text: text.to_string(),
                     kind,
+                    output: None,
                 });
             }
         }
@@ -315,7 +373,16 @@ impl App {
             }
             AgentEvent::ToolStarted { name, args } => {
                 self.current_tool = Some(name.clone());
-                self.push(format!("→ {name} {args}"), Kind::Tool);
+                self.flush_pending();
+                self.entries.push(Entry {
+                    text: format!("{name} {} …", summarize_args(&args)),
+                    kind: Kind::Tool,
+                    output: None,
+                });
+                self.pending_tool = Some(self.entries.len() - 1);
+                if self.follow {
+                    self.scroll_from_bottom = 0;
+                }
             }
             AgentEvent::ToolFinished {
                 name,
@@ -323,10 +390,19 @@ impl App {
                 output,
             } => {
                 self.current_tool = None;
-                let short: String = output.trim().chars().take(400).collect();
-                let prefix = if is_error { "✗" } else { "✓" };
-                let _ = name;
-                self.push(format!("{prefix} {short}"), Kind::Tool);
+                let mark = if is_error { "✗" } else { "✓" };
+                let entry = self
+                    .pending_tool
+                    .and_then(|i| self.entries.get_mut(i))
+                    .filter(|e| e.kind == Kind::Tool && e.output.is_none());
+                match entry {
+                    Some(entry) => {
+                        entry.text = format!("{} {mark}", entry.text.trim_end_matches(" …"));
+                        entry.output = Some(output.trim_end().to_string());
+                    }
+                    None => self.push(format!("{name} {mark}"), Kind::Tool),
+                }
+                self.pending_tool = None;
             }
             AgentEvent::AssistantDone { text } => {
                 let streamed = self.pending.take();
@@ -401,6 +477,10 @@ impl App {
             KeyCode::Esc => {
                 cancel.store(true, Ordering::SeqCst);
                 self.push("interrupt requested", Kind::Info);
+                false
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.expand_tools = !self.expand_tools;
                 false
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -712,11 +792,11 @@ impl App {
             if !self.show_reasoning && entry.kind == Kind::Reasoning {
                 return;
             }
-            if prev_kind.is_some_and(|k| k != entry.kind) {
+            if prev_kind.is_some_and(|k| k != entry.kind || entry.kind == Kind::Tool) {
                 lines.push(Line::from(""));
             }
             prev_kind = Some(entry.kind);
-            lines.extend(entry_lines(entry, width));
+            lines.extend(entry_lines(entry, width, self.expand_tools));
         };
         for entry in &self.entries {
             append(entry, &mut lines);
@@ -1006,15 +1086,53 @@ mod tests {
         let mut app = test_app();
         app.on_event(AgentEvent::ToolStarted {
             name: "bash".into(),
-            args: "{cmd}".into(),
+            args: "{\"command\":\"ls -la\"}".into(),
         });
         app.on_event(AgentEvent::ToolFinished {
             name: "bash".into(),
             is_error: false,
             output: "ok".into(),
         });
-        assert!(app.entries.iter().any(|e| e.text.contains("→ bash")));
-        assert!(app.entries.iter().any(|e| e.text.contains("✓ ok")));
+        let entry = app.entries.iter().find(|e| e.kind == Kind::Tool).unwrap();
+        assert_eq!(entry.text, "bash ls -la ✓");
+        assert_eq!(entry.output.as_deref(), Some("ok"));
+        assert_eq!(app.entries.iter().filter(|e| e.kind == Kind::Tool).count(), 1);
+    }
+
+    #[test]
+    fn unfinished_tool_shows_running_header() {
+        let mut app = test_app();
+        app.on_event(AgentEvent::ToolStarted {
+            name: "read".into(),
+            args: "{\"path\":\"Cargo.toml\"}".into(),
+        });
+        let entry = app.entries.iter().find(|e| e.kind == Kind::Tool).unwrap();
+        assert_eq!(entry.text, "read Cargo.toml …");
+    }
+
+    #[test]
+    fn tool_output_is_capped_and_expands() {
+        let mut app = test_app();
+        app.on_event(AgentEvent::ToolStarted {
+            name: "bash".into(),
+            args: "{\"command\":\"seq\"}".into(),
+        });
+        app.on_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            is_error: false,
+            output: (1..=50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+        });
+        let entry = app.entries.iter().find(|e| e.kind == Kind::Tool).unwrap();
+        let lines = entry_lines(entry, 80, false);
+        assert_eq!(lines.len(), TOOL_OUTPUT_LINES + 2, "header + 20 lines + note");
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts[1], "  line 1");
+        assert!(texts[21].contains("+30 lines (Ctrl+O to expand)"), "{texts:#?}");
+        let expanded = entry_lines(entry, 80, true);
+        assert_eq!(expanded.len(), 51);
     }
 
     #[test]
@@ -1073,8 +1191,9 @@ mod wrap_tests {
         let entry = Entry {
             text: "acknowledge this now".to_string(),
             kind: Kind::User,
+            output: None,
         };
-        let lines = entry_lines(&entry, 13);
+        let lines = entry_lines(&entry, 13, false);
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1089,7 +1208,7 @@ mod wrap_tests {
         app.on_event(super::AgentEvent::ReasoningDelta("line two".into()));
         let pending = app.pending.as_ref().unwrap();
         assert_eq!(pending.text, "line one\nline two");
-        assert_eq!(entry_lines(pending, 40).len(), 2);
+        assert_eq!(entry_lines(pending, 40, false).len(), 2);
     }
 }
 
