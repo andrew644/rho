@@ -172,7 +172,7 @@ Improvements identified from a hands-on review of the running TUI.
    render reasoning as one dim block; add a Ctrl+R toggle to hide/collapse it.
 2. [x] **Turn separation** — insert a blank line (or thin separator) between
    turns so user input, reasoning, tool output, and answers don't run together.
-3. [ ] **Markdown / code rendering** — assistant output shows raw backticks and
+3. [x] **Markdown / code rendering** — assistant output shows raw backticks and
    fences; detect code fences (indent + dim background, no reflow) at minimum,
    ideally syntax highlighting.
 4. [x] **Tool output presentation** — replace per-line `# ` prefixes with a

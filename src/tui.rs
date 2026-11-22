@@ -163,6 +163,32 @@ fn kind_style(kind: Kind) -> Style {
     }
 }
 
+fn assistant_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let style = kind_style(Kind::Assistant);
+    let code_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let mut in_fence = false;
+    let src_lines: Vec<&str> = if text.is_empty() { vec![""] } else { text.lines().collect() };
+    for src in src_lines {
+        if src.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            lines.push(Line::from(Span::styled(format!("    {src}"), code_style)));
+        } else {
+            let mut wrapped = wrap_words(src, width.max(1));
+            if wrapped.is_empty() {
+                wrapped.push(String::new());
+            }
+            for w in wrapped {
+                lines.push(Line::from(Span::styled(w, style)));
+            }
+        }
+    }
+    lines
+}
+
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = vec![String::new()];
@@ -195,6 +221,9 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 }
 
 fn entry_lines(entry: &Entry, width: usize, expand_tools: bool) -> Vec<Line<'static>> {
+    if entry.kind == Kind::Assistant {
+        return assistant_lines(&entry.text, width);
+    }
     let style = kind_style(entry.kind);
     let prefix = kind_prefix(entry.kind);
     let indent = prefix.chars().count();
@@ -1209,6 +1238,58 @@ mod wrap_tests {
         let pending = app.pending.as_ref().unwrap();
         assert_eq!(pending.text, "line one\nline two");
         assert_eq!(entry_lines(pending, 40, false).len(), 2);
+    }
+
+    fn assistant(text: &str) -> Entry {
+        Entry {
+            text: text.to_string(),
+            kind: Kind::Assistant,
+            output: None,
+        }
+    }
+
+    fn line_text(line: &super::Line) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn code_fences_render_indented_without_backticks() {
+        let entry = assistant("before\n```rust\nfn main() {}\n```\nafter");
+        let lines: Vec<String> = entry_lines(&entry, 60, false)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["before", "    fn main() {}", "after"]
+        );
+    }
+
+    #[test]
+    fn code_fences_are_not_reflowed() {
+        let long = "x".repeat(120);
+        let entry = assistant(&format!("```\n{long}\n```"));
+        let lines: Vec<String> = entry_lines(&entry, 40, false)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(lines, vec![format!("    {long}")]);
+    }
+
+    #[test]
+    fn prose_outside_fences_still_wraps() {
+        let entry = assistant("```\ncode\n```\nword word word word word");
+        let lines: Vec<String> = entry_lines(&entry, 10, false)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["    code", "word word", "word word", "word"]
+        );
     }
 }
 
