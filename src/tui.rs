@@ -304,73 +304,109 @@ fn fmt_tokens(n: usize) -> String {
     format!("{num}{unit}")
 }
 
-fn words_with_offsets(text: &str) -> Vec<(usize, &str)> {
-    let mut words = Vec::new();
-    let mut start: Option<usize> = None;
-    for (i, c) in text.char_indices() {
-        if c.is_whitespace() {
-            if let Some(s) = start.take() {
-                words.push((s, &text[s..i]));
-            }
-        } else {
-            start.get_or_insert(i);
-        }
-    }
-    if let Some(s) = start {
-        words.push((s, &text[s..]));
-    }
-    words
+struct Run {
+    col: usize,
+    start: usize,
+    end: usize,
+    space: bool,
 }
 
-fn wrap_segments(text: &str, width: usize) -> Vec<(usize, String)> {
-    let width = width.max(1);
-    let mut rows: Vec<(usize, String)> = Vec::new();
-    let lead_bytes = text.len() - text.trim_start().len();
-    let lead = text[..lead_bytes].chars().count().min(width);
-    if lead > 0 {
-        rows.push((0, " ".repeat(lead)));
+fn text_runs(text: &str) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for (col, (byte, c)) in text.char_indices().enumerate() {
+        let space = c.is_whitespace();
+        match runs.last_mut() {
+            Some(run) if run.space == space => run.end = byte + c.len_utf8(),
+            _ => runs.push(Run {
+                col,
+                start: byte,
+                end: byte + c.len_utf8(),
+                space,
+            }),
+        }
     }
-    for (byte, word) in words_with_offsets(text) {
-        let col = text[..byte].chars().count();
-        let cur = rows.last().map(|(_, s)| s.chars().count()).unwrap_or(0);
-        let sep = usize::from(cur > lead);
-        let chars: Vec<char> = word.chars().collect();
-        if cur + sep + chars.len() <= width {
-            if cur > 0 {
-                let row = &mut rows.last_mut().unwrap().1;
-                if sep > 0 {
-                    row.push(' ');
-                }
-                row.extend(chars.iter());
-            } else {
-                rows.push((col, word.to_string()));
+    runs
+}
+
+struct Wrapper {
+    width: usize,
+    rows: Vec<(usize, String)>,
+    row: String,
+    row_start: usize,
+}
+
+impl Wrapper {
+    fn new(width: usize) -> Self {
+        Self {
+            width: width.max(1),
+            rows: Vec::new(),
+            row: String::new(),
+            row_start: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.row.chars().count()
+    }
+
+    fn flush(&mut self) {
+        if !self.row.is_empty() {
+            let text = std::mem::take(&mut self.row);
+            self.rows.push((self.row_start, text));
+        }
+    }
+
+    fn push(&mut self, col: usize, text: &str) {
+        for (col, c) in (col..).zip(text.chars()) {
+            if self.row.is_empty() {
+                self.row_start = col;
+            } else if self.len() == self.width {
+                self.flush();
+                self.row_start = col;
             }
-            continue;
+            self.row.push(c);
         }
-        if chars.len() <= width {
-            rows.push((col, word.to_string()));
-            continue;
-        }
-        let mut start = 0;
-        while start + width < chars.len() {
-            rows.push((col + start, chars[start..start + width].iter().collect()));
-            start += width;
-        }
-        rows.push((col + start, chars[start..].iter().collect()));
     }
-    rows
+
+    fn finish(mut self) -> Vec<(usize, String)> {
+        self.flush();
+        self.rows
+    }
+}
+
+fn wrap_line(text: &str, width: usize) -> Vec<(usize, String)> {
+    let mut w = Wrapper::new(width);
+    let mut gap = String::new();
+    let mut gap_col = 0usize;
+    for run in text_runs(text) {
+        let piece = &text[run.start..run.end];
+        if run.space {
+            if gap.is_empty() {
+                gap_col = run.col;
+            }
+            gap.push_str(piece);
+            continue;
+        }
+        let pending = std::mem::take(&mut gap);
+        let fits = w.row.is_empty()
+            || w.len() + pending.chars().count() + piece.chars().count() <= w.width;
+        if fits {
+            w.push(gap_col, &pending);
+        } else {
+            w.flush();
+        }
+        w.push(run.col, piece);
+    }
+    w.push(gap_col, &gap);
+    w.finish()
 }
 
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    let trimmed = text.trim_start();
-    let mut lines = wrap_segments(trimmed, width)
+    wrap_line(text.trim_start(), width)
         .into_iter()
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>();
-    if lines.len() == 1 && lines[0].is_empty() {
-        lines.clear();
-    }
-    lines
+        .map(|(_, line)| line.trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 fn entry_lines(
@@ -913,7 +949,7 @@ impl App {
         let avail = width.saturating_sub(INPUT_INDENT).max(1);
         let mut flat: Vec<InputRow> = Vec::new();
         for (line, text) in self.input.split('\n').enumerate() {
-            let mut wrapped = wrap_segments(text, avail);
+            let mut wrapped = wrap_line(text, avail);
             if wrapped.is_empty() {
                 wrapped.push((0, String::new()));
             }
@@ -1898,13 +1934,36 @@ mod tests {
     }
 
     #[test]
-    fn input_layout_clamps_the_cursor_to_the_end_of_its_row() {
+    fn input_layout_shows_spaces_beyond_the_row_width_on_the_next_row() {
         let mut app = test_app();
         app.insert_text("one two   ");
         app.cursor = app.input.len();
         let layout = app.input_layout(9, 5);
-        assert_eq!(layout_texts(&layout), vec!["❯ one two"]);
-        assert_eq!((layout.cursor_row, layout.cursor_col), (0, 7));
+        assert_eq!(layout_texts(&layout), vec!["❯ one two", "     "]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 3));
+    }
+
+    #[test]
+    fn input_layout_keeps_trailing_spaces_on_their_own_row() {
+        let mut app = test_app();
+        app.insert_text("one two   ");
+        app.cursor = "one two  ".len();
+        let layout = app.input_layout(20, 5);
+        assert_eq!(layout_texts(&layout), vec!["❯ one two   "]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (0, 9));
+        let layout = app.input_layout(9, 5);
+        assert_eq!(layout_texts(&layout), vec!["❯ one two", "     "]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 2));
+    }
+
+    #[test]
+    fn input_layout_renders_a_line_of_only_spaces() {
+        let mut app = test_app();
+        app.insert_text("a\n   \nb");
+        app.cursor = "a\n   ".len();
+        let layout = app.input_layout(10, 5);
+        assert_eq!(layout_texts(&layout), vec!["❯ a", "     ", "  b"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 3));
     }
 
     #[test]
