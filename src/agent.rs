@@ -284,6 +284,16 @@ impl Agent {
         }
     }
 
+    fn send_usage(&self, events: &broadcast::Sender<AgentEvent>) {
+        let _ = events.send(AgentEvent::ContextUsage {
+            est_tokens: estimate_tokens(&self.history),
+            message_count: self.history.len(),
+            session_path: self.session_path.as_ref().map(|p| p.display().to_string()),
+            session_name: self.session_header.as_ref().and_then(|h| h.name.clone()),
+            pwd: self.pwd.display().to_string(),
+        });
+    }
+
     fn persist(&self, events: &broadcast::Sender<AgentEvent>) {
         if let (Some(path), Some(header)) = (&self.session_path, &self.session_header) {
             let mut header = header.clone();
@@ -298,13 +308,7 @@ impl Agent {
                 let _ = events.send(AgentEvent::Error(format!("failed to save session: {e}")));
             }
         }
-        let _ = events.send(AgentEvent::ContextUsage {
-            est_tokens: estimate_tokens(&self.history),
-            message_count: self.history.len(),
-            session_path: self.session_path.as_ref().map(|p| p.display().to_string()),
-            session_name: self.session_header.as_ref().and_then(|h| h.name.clone()),
-            pwd: self.pwd.display().to_string(),
-        });
+        self.send_usage(events);
     }
 
     async fn run_shell(
@@ -389,6 +393,7 @@ impl Agent {
 
     async fn run_turn(&mut self, user_text: &str, events: &broadcast::Sender<AgentEvent>) {
         self.history.push(Message::user(user_text));
+        self.send_usage(events);
         if let Err(e) = self.drive(events).await {
             let _ = events.send(AgentEvent::Error(e.to_string()));
         }
@@ -484,6 +489,7 @@ impl Agent {
                         tool_calls: Some(assistant.tool_calls.clone()),
                         tool_call_id: None,
                     });
+                    self.send_usage(events);
                     for call in &assistant.tool_calls {
                         let _ = events.send(AgentEvent::ToolStarted {
                             name: call.function.name.clone(),
@@ -498,6 +504,7 @@ impl Agent {
                             &call.id,
                             TRUNCATED_TOOL_RESULT.to_string(),
                         ));
+                        self.send_usage(events);
                     }
                 }
                 if !self.truncation_recovery_used {
@@ -537,6 +544,7 @@ impl Agent {
                 message.content = Some(String::new());
             }
             self.history.push(message);
+            self.send_usage(events);
 
             if assistant.tool_calls.is_empty() {
                 let _ = events.send(AgentEvent::AssistantDone {
@@ -551,6 +559,7 @@ impl Agent {
                         &call.id,
                         "Interrupted by user".to_string(),
                     ));
+                    self.send_usage(events);
                     continue;
                 }
                 let args_preview: String = call.function.arguments.chars().take(200).collect();
@@ -571,6 +580,7 @@ impl Agent {
                     output: output.clone(),
                 });
                 self.history.push(Message::tool_result(&call.id, output));
+                self.send_usage(events);
             }
         }
         let _ = events.send(AgentEvent::Error(
@@ -620,10 +630,16 @@ impl Agent {
             match &spec.mode {
                 LoopMode::Until { condition } => match self.check_condition(condition).await {
                     Ok(true) => break "condition met".to_string(),
-                    Ok(false) => self.history.push(Message::user(spec.prompt.clone())),
+                    Ok(false) => {
+                        self.history.push(Message::user(spec.prompt.clone()));
+                        self.send_usage(events);
+                    }
                     Err(e) => break format!("condition check failed: {e}"),
                 },
-                _ => self.history.push(Message::user(spec.prompt.clone())),
+                _ => {
+                    self.history.push(Message::user(spec.prompt.clone()));
+                    self.send_usage(events);
+                }
             }
         };
         self.history.push(Message::user(format!(
@@ -631,6 +647,7 @@ impl Agent {
             spec.describe_mode(),
             reason
         )));
+        self.send_usage(events);
         let _ = events.send(AgentEvent::LoopFinished { iterations, reason });
     }
 
@@ -657,7 +674,80 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::Agent;
+    use super::*;
+
+    fn test_config() -> Config {
+        serde_yaml::from_str(
+            "provider:\n  base_url: http://127.0.0.1:1/v1\n  api_key: test\nmodel:\n  id: test-model\n",
+        )
+        .unwrap()
+    }
+
+    fn test_agent() -> (Agent, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        let agent = Agent {
+            client: Client::new(&config.provider.base_url, &config.provider.api_key),
+            model: config.model.id.clone(),
+            tools: all_tools(dir.path().to_path_buf())
+                .into_iter()
+                .map(Arc::from)
+                .collect(),
+            history: vec![Message::system("sys")],
+            cancel: Arc::new(AtomicBool::new(false)),
+            pwd: dir.path().to_path_buf(),
+            config,
+            session_path: None,
+            session_header: None,
+            truncation_recovery_used: false,
+            overflow_recovery_used: false,
+        };
+        (agent, dir)
+    }
+
+    fn recv_usage(rx: &mut broadcast::Receiver<AgentEvent>) -> (usize, usize) {
+        match rx.try_recv().unwrap() {
+            AgentEvent::ContextUsage {
+                est_tokens,
+                message_count,
+                ..
+            } => (est_tokens, message_count),
+            other => panic!("expected ContextUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_usage_tracks_history_growth() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let (mut agent, _dir) = test_agent();
+        agent.send_usage(&tx);
+        let (before, count) = recv_usage(&mut rx);
+        assert_eq!(count, 1);
+        agent
+            .history
+            .push(Message::user("this message adds tokens to the context"));
+        agent.send_usage(&tx);
+        let (after, count) = recv_usage(&mut rx);
+        assert_eq!(count, 2);
+        assert!(after > before);
+    }
+
+    #[tokio::test]
+    async fn run_turn_reports_usage_as_soon_as_the_user_message_lands() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let (mut agent, _dir) = test_agent();
+        let before = estimate_tokens(&agent.history);
+        agent
+            .run_turn("a prompt that should show up in the context", &tx)
+            .await;
+        let mut usage = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::ContextUsage { est_tokens, .. } = event {
+                usage = Some(est_tokens);
+            }
+        }
+        assert!(usage.is_some_and(|est| est > before));
+    }
 
     #[test]
     fn resolve_pwd_accepts_absolute_and_relative_dirs() {
