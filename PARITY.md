@@ -39,11 +39,13 @@ under rho's design constraints is. This document splits pi's features into:
 | Session persistence (auto-save JSONL per working directory) | `session` module; sessions stored under the state dir keyed by cwd; header + message records |
 | `pi --continue` / `/new` / `/resume` / `/session` / `/name` | CLI `--continue`; TUI `/new`, `/resume [n]`, `/session`, `/name <text>` |
 | Compaction: `/compact [instructions]` + auto-compaction near the context limit | `compaction` module; token estimate ≈ chars/4; reserve/keep-recent thresholds configurable; summary replaces old prefix, recent messages kept |
-| Footer showing model, context usage | Status bar shows model id, estimated context tokens, session name |
 | Prompt templates (markdown files → `/name` commands with `$1`, `$@`, `${1:-def}` substitutions) | `templates` module; loaded from `~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` |
 | `!` / `!!` shell escapes (run a command, optionally feed output to the model) | TUI `!<cmd>` runs and appends output to conversation; `!!<cmd>` runs without sending to the model |
 | Print mode (`pi --print "…"`, piped stdin, `@file` inclusion, initial prompts) | `rho --print [--continue] [--model id] [@file…] <prompt…>`; final answer to stdout, exit non-zero on error |
 | `/model` model selection | `model.models` list in config; `/model` lists, `/model <id>` switches; CLI `--model` override |
+| Multi-line editor (Shift+Enter), tool-output expand (Ctrl+O), thinking toggle (Ctrl+R in rho) | Shift+Enter/Ctrl+J insert newlines (bracketed paste inserts verbatim); Ctrl+O expands capped tool output; Ctrl+R shows/hides reasoning |
+| Slash-command and template autocomplete | Tab / Shift-Tab cycle matching commands and template names |
+| Footer showing model, context usage | Status bar shows session/cwd, model id, spinner + elapsed time, context usage as percent with yellow/red thresholds, session name |
 
 ## 3. Out of scope by design
 
@@ -54,7 +56,7 @@ are **not** parity gaps for rho's purposes:
 | Pi feature | Why excluded |
 |---|---|
 | Extension system, `context`/`tool`/command hooks | DESIGN.md: "No extension system" |
-| Themes, custom keybindings, pi packages | Presentation/plumbing layers tied to the extension system |
+| Themes (pi theme system), custom keybindings, pi packages | pi's themes/extensions are tied to the extension system; rho ships a `theme: dark\|light\|ansi` config palette instead |
 | Skills (`/skill:name`, skill discovery) | Superseded for rho by prompt templates; no discovery/trust machinery |
 | MCP servers (`/mcp`) | External provider/plugin surface; rho is local-model-only by design |
 | RPC mode, JSON event mode, TypeScript SDK | rho embeds its own harness (TUI + Discord bridge) instead |
@@ -64,7 +66,7 @@ are **not** parity gaps for rho's purposes:
 | `@`-file autocomplete in the TUI, image paste/drag, image tool results | Text-only client by design (see DESIGN.md tools section); `@file` works in CLI print mode |
 | Project trust (`/trust`), settings hierarchy (`settings.json`, project settings) | Single YAML config by design |
 | `/reload`, `/hotkeys`, `/changelog` | Tied to dynamic resource loading |
-| Multi-line editor (Shift+Enter), external editor (Ctrl+G), tool-output expand (Ctrl+O), thinking toggle (Ctrl+T) | TUI convenience; rho's input is single-line |
+| External editor (Ctrl+G) | Not implemented; rho's input is an inline widget |
 
 ## 4. Rho-only additions (not in pi)
 

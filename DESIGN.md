@@ -20,7 +20,9 @@ rho
 ├── compaction  token estimation + cut-point logic for /compact and auto-compaction
 ├── templates   prompt templates: markdown files → slash commands with $1/$@ substitutions
 ├── discord     remote control via Discord (gateway websocket + REST send)
-└── tui         ratatui chat UI: transcript viewport, streaming status, input line, slash commands
+└── tui         ratatui chat UI: wrapped transcript (reasoning blocks, code fences,
+                capped tool output), spinner/percent footer, multiline input,
+                slash-command autocomplete, theming
 ```
 
 ### Data flow
@@ -109,6 +111,7 @@ model:
   max_tokens: 4096
   models: []            # extra ids selectable with /model
 context_window: 200000
+theme: dark             # dark | light | ansi
 compaction:
   enabled: true
   reserve_tokens: 16384
@@ -202,6 +205,6 @@ Improvements identified from a hands-on review of the running TUI.
 11. [x] **Configurable theme** — yellow tool lines and dark-gray reasoning are
     unreadable on light terminals; add a palette/theme section to config
     (at least dark/light/ansi variants).
-12. [ ] **Rich welcome screen** — first frame should show version, model,
+12. [x] **Rich welcome screen** — first frame should show version, model,
     context window, cwd, and session file so config can be verified before the
     first prompt.

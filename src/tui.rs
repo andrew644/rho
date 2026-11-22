@@ -405,10 +405,18 @@ impl App {
         templates: Vec<Template>,
         context_window: u32,
         theme: Theme,
+        session_path: Option<String>,
     ) -> Self {
+        let welcome = format!(
+            "rho v{} · model {model} · context {} tokens\ncwd {}\nsession {}\n/help for commands · Esc interrupts · Ctrl+R toggles reasoning · Ctrl+O expands tool output",
+            env!("CARGO_PKG_VERSION"),
+            fmt_tokens(context_window as usize),
+            cwd.display(),
+            session_path.as_deref().unwrap_or("(new session)"),
+        );
         Self {
             entries: vec![Entry {
-                text: "rho — type a prompt, /help for commands".to_string(),
+                text: welcome,
                 kind: Kind::Info,
                 output: None,
             }],
@@ -1183,6 +1191,7 @@ pub struct TuiOptions {
     pub templates: Vec<Template>,
     pub context_window: u32,
     pub theme: ThemeName,
+    pub session_path: Option<String>,
 }
 
 async fn run_inner(
@@ -1199,6 +1208,7 @@ async fn run_inner(
         opts.templates,
         opts.context_window,
         Theme::new(opts.theme),
+        opts.session_path,
     );
     let mut keys = crossterm::event::EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
@@ -1248,6 +1258,7 @@ mod tests {
             vec![],
             128_000,
             Theme::new(ThemeName::Dark),
+            None,
         )
     }
 
@@ -1345,6 +1356,7 @@ mod tests {
             }],
             128_000,
             Theme::new(ThemeName::Dark),
+            None,
         );
         app.on_submit("/greet world", &tx);
         match rx.try_recv().unwrap() {
@@ -1650,7 +1662,7 @@ mod wrap_tests {
 
     #[test]
     fn reasoning_entry_renders_as_one_block() {
-        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         app.on_event(super::AgentEvent::ReasoningDelta("line one\n".into()));
         app.on_event(super::AgentEvent::ReasoningDelta("line two".into()));
         let pending = app.pending.as_ref().unwrap();
@@ -1724,7 +1736,31 @@ mod draw_tests {
             vec![],
             128_000,
             Theme::new(ThemeName::Dark),
+            None,
         )
+    }
+
+    #[test]
+    fn welcome_shows_version_model_context_cwd_session() {
+        let app = App::new(
+            PathBuf::from("/home/user/repo"),
+            "qwen4exp".into(),
+            vec!["qwen4exp".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            Some("/state/sess.jsonl".to_string()),
+        );
+        let text: String = app.entries
+            .iter()
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(&format!("rho v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("qwen4exp"), "{text}");
+        assert!(text.contains("128k tokens"), "{text}");
+        assert!(text.contains("/home/user/repo"), "{text}");
+        assert!(text.contains("/state/sess.jsonl"), "{text}");
     }
 
     #[test]
@@ -1789,6 +1825,7 @@ mod scroll_tests {
             vec![],
             128_000,
             Theme::new(ThemeName::Dark),
+            None,
         )
     }
 
@@ -1807,7 +1844,7 @@ mod scroll_tests {
 
     #[test]
     fn pages_vertically_not_horizontally() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1847,7 +1884,7 @@ mod scroll_tests {
 
     #[test]
     fn scrolled_view_survives_streaming_output() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1881,7 +1918,7 @@ mod scroll_tests {
 
     #[test]
     fn wheel_scroll_detaches_and_reattaches_follow() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         assert!(app.follow);
         app.scroll_by(3);
         assert!(!app.follow);
@@ -1905,7 +1942,7 @@ mod scroll_tests {
 
     #[test]
     fn scrollbar_appears_on_overflow_and_follows_scroll() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1921,7 +1958,7 @@ mod scroll_tests {
 
     #[test]
     fn no_scrollbar_when_content_fits() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         app.push("short message".to_string(), Kind::User);
         let screen = render(&mut app, 80, 24);
         let col = right_column(&screen);
@@ -2003,7 +2040,7 @@ mod scroll_tests {
 
     #[test]
     fn long_lines_wrap_within_width() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         app.push("x".repeat(500), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
         for row in &screen {
@@ -2017,7 +2054,7 @@ mod scroll_tests {
 
     #[test]
     fn different_kinds_are_separated_by_blank_line() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         app.push("hello there".to_string(), Kind::User);
         app.push("a response".to_string(), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
@@ -2029,7 +2066,7 @@ mod scroll_tests {
 
     #[test]
     fn ctrl_r_toggles_reasoning_visibility() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark));
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
         app.push("because reasons".to_string(), Kind::Reasoning);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));

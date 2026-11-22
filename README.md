@@ -16,6 +16,7 @@ model:
   id: qwen4exp
   max_tokens: 4096
   # models: [other-model]     # extra ids selectable with /model
+# theme: light              # dark | light | ansi
 # compaction:
 #   enabled: true
 #   reserve_tokens: 16384
@@ -38,11 +39,18 @@ cargo run
 ## Usage
 
 - Type a prompt and press Enter. The agent streams reasoning (∴), answers,
-  and tool activity (#). The input border shows the model, estimated context
-  size, and current status.
+  and tool activity. Tool calls render as one header line (`bash ls -la ✓`)
+  with indented output; long output is capped — Ctrl+O expands it. Code fences
+  render as indented blocks. The footer shows session/cwd, model, an animated
+  spinner with elapsed time, and context usage as a percentage of the window
+  (yellow/red as auto-compaction approaches). While the agent runs, the input
+  border dims and Enter queues the text.
 - Esc interrupts the current generation/loop. The mouse wheel, PgUp/PgDn, and
   Home/End scroll the transcript (a scrollbar shows the viewport). Up/Down walk
   prompt history. Ctrl+C or `/quit` exits.
+- Ctrl+R toggles the reasoning block. Tab / Shift-Tab complete slash commands
+  and template names. Shift+Enter or Ctrl+J insert newlines in the input
+  (pasted multiline text is never submitted early); Enter submits.
 - Tools: `read`, `bash`, `edit`, `write` (same semantics as pi).
 - `!cmd` runs a shell command and shares its output with the model;
   `!!cmd` runs it without sharing.

@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::broadcast::channel(512);
     let (agent_tx, cancel) =
-        Agent::spawn_resumed(config.clone(), cwd.clone(), event_tx.clone(), resumed);
+        Agent::spawn_resumed(config.clone(), cwd.clone(), event_tx.clone(), resumed.clone());
     if config.discord.enabled {
         rho::discord::spawn(config.clone(), agent_tx.clone(), event_tx.clone());
     }
@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         templates: loaded_templates,
         context_window: config.context_window,
         theme: config.theme,
+        session_path: resumed.as_ref().map(|p| p.display().to_string()),
     };
     rho::tui::run(agent_tx, cancel, event_rx, tui).await
 }
