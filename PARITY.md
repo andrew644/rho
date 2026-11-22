@@ -38,7 +38,8 @@ under rho's design constraints is. This document splits pi's features into:
 |---|---|
 | Session persistence (auto-save JSONL per working directory) | `session` module; sessions stored under the state dir keyed by cwd; header + message records |
 | `pi --continue` / `/new` / `/resume` / `/session` / `/name` | CLI `--continue`; TUI `/new`, `/resume [n]`, `/session`, `/name <text>` |
-| Compaction: `/compact [instructions]` + auto-compaction near the context limit | `compaction` module; token estimate ≈ chars/4; reserve/keep-recent thresholds configurable; summary replaces old prefix, recent messages kept |
+| Compaction: `/compact [instructions]` + auto-compaction near the context limit | `compaction` module; token estimate ≈ chars/4; reserve/keep-recent thresholds configurable; summary replaces old prefix, recent messages kept; conversation serialized for summarization with 2000-char tool results; cut points at user and assistant messages |
+| Overflow / truncated-length recovery: one compact-and-retry attempt, session stays usable | `agent` + `client`: `ApiError::is_context_overflow` pattern matching, history sanitizer, synthetic results for truncated tool calls |
 | Prompt templates (markdown files → `/name` commands with `$1`, `$@`, `${1:-def}` substitutions) | `templates` module; loaded from `~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` |
 | `!` / `!!` shell escapes (run a command, optionally feed output to the model) | TUI `!<cmd>` runs and appends output to conversation; `!!<cmd>` runs without sending to the model |
 | Print mode (`pi --print "…"`, piped stdin, `@file` inclusion, initial prompts) | `rho --print [--continue] [--model id] [@file…] <prompt…>`; final answer to stdout, exit non-zero on error |

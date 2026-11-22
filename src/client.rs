@@ -27,6 +27,73 @@ pub struct Client {
     api_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiError {
+    pub status: u16,
+    pub text: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model API returned {}: {}", self.status, self.text)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+const OVERFLOW_MARKERS: &[&str] = &[
+    "prompt is too long",
+    "prompt too long",
+    "prompt exceeds max length",
+    "request_too_large",
+    "input is too long for requested model",
+    "exceeds the context window",
+    "maximum context length",
+    "context window exceeded",
+    "context window exceeds limit",
+    "exceeds the maximum number of tokens allowed",
+    "maximum prompt length is",
+    "reduce the length of the messages",
+    "exceeds the maximum allowed input length",
+    "is longer than the model",
+    "exceeds the limit of",
+    "exceeds the available context size",
+    "greater than the context length",
+    "exceeded model token limit",
+    "too large for model with",
+    "but the configured context size is",
+    "model_context_window_exceeded",
+    "exceeded max context length",
+    "range of input length should be",
+    "context_length_exceeded",
+    "context length exceeded",
+    "too many tokens",
+    "token limit exceeded",
+];
+
+const NON_OVERFLOW_MARKERS: &[&str] = &[
+    "rate limit",
+    "too many requests",
+    "throttling error:",
+    "service unavailable:",
+];
+
+impl ApiError {
+    pub fn is_context_overflow(&self) -> bool {
+        if self.status == 413 {
+            return true;
+        }
+        let text = self.text.to_lowercase();
+        if NON_OVERFLOW_MARKERS
+            .iter()
+            .any(|marker| text.contains(marker))
+        {
+            return false;
+        }
+        OVERFLOW_MARKERS.iter().any(|marker| text.contains(marker))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct Chunk {
     choices: Vec<ChunkChoice>,
@@ -214,7 +281,10 @@ impl Client {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            bail!("model API returned {status}: {text}");
+            return Err(anyhow::Error::new(ApiError {
+                status: status.as_u16(),
+                text,
+            }));
         }
 
         let mut acc = AssistantAccumulator::default();
@@ -351,5 +421,42 @@ mod tests {
             "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}
         })));
         assert_eq!(acc.finish().usage.prompt_tokens, 10);
+    }
+
+    fn api_error(status: u16, text: &str) -> ApiError {
+        ApiError {
+            status,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn detects_context_overflow_errors() {
+        assert!(api_error(400, "This model's maximum context length is 8192 tokens. However, your request has 12000 input tokens.").is_context_overflow());
+        assert!(
+            api_error(400, "prompt is too long: 213462 tokens > 200000 maximum")
+                .is_context_overflow()
+        );
+        assert!(api_error(400, "Range of input length should be [1, 8192]").is_context_overflow());
+        assert!(api_error(
+            400,
+            "llama.cpp: the request exceeds the available context size, try increasing it"
+        )
+        .is_context_overflow());
+        assert!(api_error(413, "failed to parse request").is_context_overflow());
+    }
+
+    #[test]
+    fn ignores_non_overflow_errors() {
+        assert!(
+            !api_error(400, "invalid tool message: message must contain 'content'")
+                .is_context_overflow()
+        );
+        assert!(!api_error(
+            429,
+            "Too many tokens: rate limit exceeded, too many requests"
+        )
+        .is_context_overflow());
+        assert!(!api_error(500, "internal server error").is_context_overflow());
     }
 }

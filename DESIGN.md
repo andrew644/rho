@@ -44,7 +44,7 @@ rho
 - SSE deltas carry `content`, `reasoning_content` (shown as a dim reasoning
   line), and `tool_calls` accumulated by index across deltas.
 - Finish reasons: `stop` → done, `tool_calls` → execute tools, append tool
-  results, continue; `length` → surface truncation note.
+  results, continue; `length` → recovery (see Context management).
 
 ### Tools
 
@@ -83,18 +83,33 @@ model, and redirects subsequent `!` / `!!` shell commands.
 
 Token usage is estimated at ~4 chars/token. When
 `est_tokens + reserve_tokens > context_window`, the agent compacts before
-the next model request: it walks back from the end to find a user-message
-cut point that keeps `keep_recent_tokens` of recent history, asks the model
+the next model request: it walks back from the end to find a user- or
+assistant-message cut point that keeps `keep_recent_tokens` of recent
+history (tool results are never split from their tool call), asks the model
 for a structured summary of everything before the cut, and rebuilds the
 history as system + summary + kept tail. `/compact [instructions]` runs the
 same flow manually; `!cmd` / `!!cmd` run shell commands with or without
 feeding the output to the model.
 
+Summary requests serialize the conversation to plain text (`[User]:`,
+`[Assistant]:`, `[Assistant tool calls]:`, `[Tool result]:`) with tool
+results capped at 2000 characters, so the summarization request is always
+smaller than the context it replaces.
+
+Every request is built from a sanitized copy of the history: assistant
+messages always carry content or tool calls, every tool call is answered
+exactly once (missing answers get a synthetic tool result), and orphaned
+tool results are dropped. This keeps strict servers such as vLLM from
+rejecting the follow-up request with HTTP 400 after a failed turn.
+
 Like pi, a response truncated at `max_tokens` triggers a single compact-and-
-retry recovery: the truncated attempt is dropped, context is compacted, and
-the request is retried once. Partial (mid-tool-call) truncations are never
-replayed to the model. If the retry truncates again the turn ends with
-"truncated response recovery failed after one compact-and-retry attempt".
+retry recovery. A truncated attempt is never replayed as-is: text-only
+truncations are omitted from model context, while truncated tool calls stay
+in history with synthetic "not executed" results so the model can re-issue
+them. If the retry truncates again the turn ends with "Response was
+truncated before completion." plus a recovery-failed note, and the session
+stays usable for the next prompt. A context-overflow API error (matched with
+pi's overflow patterns) takes the same single compact-and-retry path.
 
 ### Prompt templates
 

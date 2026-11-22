@@ -78,7 +78,9 @@ automatically when the context estimate nears `context_window`, or manually
 with `/compact`.
 
 If a response is cut off at `max_tokens`, rho compacts and retries the
-request once (like pi) instead of just reporting the truncation.
+request once (like pi). A context-overflow error from the server gets the
+same compact-and-retry treatment, and a turn that still ends in failure
+leaves the session history valid, so you can keep prompting.
 
 ### Prompt templates
 

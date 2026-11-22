@@ -3,6 +3,7 @@ pub mod client;
 pub mod compaction;
 pub mod config;
 pub mod discord;
+pub mod history;
 pub mod loops;
 pub mod prompt;
 pub mod session;

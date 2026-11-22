@@ -6,11 +6,12 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::client::{Client, StreamEvent};
+use crate::client::{ApiError, Client, StreamEvent};
 use crate::compaction::{
     build_summary_request, compacted_history, estimate_tokens, find_cut_point, should_compact,
 };
 use crate::config::Config;
+use crate::history::sanitize_history;
 use crate::loops::{LoopMode, LoopSpec};
 use crate::prompt::build_system_prompt;
 use crate::session::{self, SessionHeader};
@@ -80,6 +81,17 @@ pub struct Agent {
     session_path: Option<PathBuf>,
     session_header: Option<SessionHeader>,
     truncation_recovery_used: bool,
+    overflow_recovery_used: bool,
+}
+
+pub const TRUNCATED_TOOL_RESULT: &str =
+    "Tool call was not executed: the response hit the output token limit, so its arguments may \
+     be truncated. Re-issue the tool call with complete arguments.";
+
+fn is_context_overflow(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ApiError>()
+        .is_some_and(|error| error.is_context_overflow())
 }
 
 impl Agent {
@@ -138,6 +150,7 @@ impl Agent {
             cancel: cancel.clone(),
             pwd,
             truncation_recovery_used: false,
+            overflow_recovery_used: false,
             session_path,
             session_header,
         };
@@ -208,27 +221,25 @@ impl Agent {
                             let _ = events.send(AgentEvent::Info(format!("model: {id}")));
                         }
                     }
-                    AgentCommand::SetPwd { path } => {
-                        match Agent::resolve_pwd(&agent.pwd, &path) {
-                            Ok(pwd) => {
-                                agent.pwd = pwd.clone();
-                                agent.tools =
-                                    all_tools(pwd.clone()).into_iter().map(Arc::from).collect();
-                                if let Some(first) = agent.history.first_mut() {
-                                    *first = Message::system(build_system_prompt(&pwd));
-                                }
-                                agent.history.push(Message::user(format!(
-                                    "The working directory changed to {}.",
-                                    pwd.display()
-                                )));
-                                let _ = events
-                                    .send(AgentEvent::Info(format!("pwd: {}", pwd.display())));
+                    AgentCommand::SetPwd { path } => match Agent::resolve_pwd(&agent.pwd, &path) {
+                        Ok(pwd) => {
+                            agent.pwd = pwd.clone();
+                            agent.tools =
+                                all_tools(pwd.clone()).into_iter().map(Arc::from).collect();
+                            if let Some(first) = agent.history.first_mut() {
+                                *first = Message::system(build_system_prompt(&pwd));
                             }
-                            Err(e) => {
-                                let _ = events.send(AgentEvent::Error(e));
-                            }
+                            agent.history.push(Message::user(format!(
+                                "The working directory changed to {}.",
+                                pwd.display()
+                            )));
+                            let _ =
+                                events.send(AgentEvent::Info(format!("pwd: {}", pwd.display())));
                         }
-                    }
+                        Err(e) => {
+                            let _ = events.send(AgentEvent::Error(e));
+                        }
+                    },
                 }
                 agent.persist(&events);
                 let _ = events.send(AgentEvent::Idle);
@@ -331,13 +342,13 @@ impl Agent {
         instructions: Option<&str>,
         events: &broadcast::Sender<AgentEvent>,
         manual: bool,
-    ) {
+    ) -> bool {
         let Some(cut) = find_cut_point(&self.history, self.config.compaction.keep_recent_tokens)
         else {
             if manual {
                 let _ = events.send(AgentEvent::Info("nothing to compact yet".to_string()));
             }
-            return;
+            return false;
         };
         let to_summarize = &self.history[1..cut];
         let request = build_summary_request(to_summarize, instructions);
@@ -360,11 +371,11 @@ impl Agent {
                 let _ = events.send(AgentEvent::Error(
                     "compaction produced an empty summary; history unchanged".to_string(),
                 ));
-                return;
+                return false;
             }
             Err(e) => {
                 let _ = events.send(AgentEvent::Error(format!("compaction failed: {e}")));
-                return;
+                return false;
             }
         };
         let dropped = cut - 1;
@@ -373,6 +384,7 @@ impl Agent {
         let _ = events.send(AgentEvent::Info(format!(
             "compacted {dropped} messages (~{before} → ~{after} tokens)"
         )));
+        true
     }
 
     async fn run_turn(&mut self, user_text: &str, events: &broadcast::Sender<AgentEvent>) {
@@ -403,11 +415,14 @@ impl Agent {
     async fn drive(&mut self, events: &broadcast::Sender<AgentEvent>) -> anyhow::Result<()> {
         let specs = self.tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
         self.truncation_recovery_used = false;
+        self.overflow_recovery_used = false;
+        self.history = sanitize_history(&self.history);
         for _ in 0..self.config.loop_config.max_turns_per_run {
             if self.cancelled() {
                 return Ok(());
             }
             self.maybe_autocompact(events).await;
+            let request = sanitize_history(&self.history);
             let (stx, mut srx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
             let fwd = events.clone();
             let forwarder = tokio::spawn(async move {
@@ -424,7 +439,7 @@ impl Agent {
                 .client
                 .stream_chat(
                     &self.model,
-                    &self.history,
+                    &request,
                     &specs,
                     self.config.model.max_tokens,
                     None,
@@ -439,12 +454,52 @@ impl Agent {
                     if self.cancelled() {
                         return Ok(());
                     }
+                    if !self.overflow_recovery_used && is_context_overflow(&e) {
+                        self.overflow_recovery_used = true;
+                        let _ = events.send(AgentEvent::Info(
+                            "context overflow; compacting and retrying".to_string(),
+                        ));
+                        if self.compact_now(None, events, false).await {
+                            continue;
+                        }
+                        let _ = events.send(AgentEvent::Error(
+                            "context overflow recovery failed: nothing left to compact".to_string(),
+                        ));
+                    }
                     return Err(e);
                 }
             };
             forwarder.abort();
 
             if assistant.finish_reason.as_deref() == Some("length") {
+                let text = assistant.content.clone();
+                if !assistant.tool_calls.is_empty() {
+                    self.history.push(Message {
+                        role: "assistant".to_string(),
+                        content: if text.is_empty() {
+                            None
+                        } else {
+                            Some(text.clone())
+                        },
+                        tool_calls: Some(assistant.tool_calls.clone()),
+                        tool_call_id: None,
+                    });
+                    for call in &assistant.tool_calls {
+                        let _ = events.send(AgentEvent::ToolStarted {
+                            name: call.function.name.clone(),
+                            args: call.function.arguments.chars().take(200).collect(),
+                        });
+                        let _ = events.send(AgentEvent::ToolFinished {
+                            name: call.function.name.clone(),
+                            is_error: true,
+                            output: TRUNCATED_TOOL_RESULT.to_string(),
+                        });
+                        self.history.push(Message::tool_result(
+                            &call.id,
+                            TRUNCATED_TOOL_RESULT.to_string(),
+                        ));
+                    }
+                }
                 if !self.truncation_recovery_used {
                     self.truncation_recovery_used = true;
                     let _ = events.send(AgentEvent::Info(
@@ -454,20 +509,12 @@ impl Agent {
                     continue;
                 }
                 let _ = events.send(AgentEvent::Error(
+                    "Response was truncated before completion.".to_string(),
+                ));
+                let _ = events.send(AgentEvent::Error(
                     "truncated response recovery failed after one compact-and-retry attempt"
                         .to_string(),
                 ));
-                let text = assistant.content.clone();
-                self.history.push(Message {
-                    role: "assistant".to_string(),
-                    content: if text.is_empty() {
-                        None
-                    } else {
-                        Some(text.clone())
-                    },
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
                 let _ = events.send(AgentEvent::AssistantDone { text });
                 return Ok(());
             }
@@ -592,7 +639,7 @@ impl Agent {
             "You are evaluating a loop exit condition. Answer with exactly YES or NO.\n\
              Conversation context is above.\nCondition: {condition}"
         );
-        let mut messages = self.history.clone();
+        let mut messages = sanitize_history(&self.history);
         messages.push(Message::user(prompt));
         let answer = self
             .client

@@ -122,8 +122,12 @@ async fn main() -> anyhow::Result<()> {
             && (!std::io::stdout().is_terminal() || !std::io::stdin().is_terminal()));
 
     let (event_tx, event_rx) = tokio::sync::broadcast::channel(512);
-    let (agent_tx, cancel) =
-        Agent::spawn_resumed(config.clone(), pwd.clone(), event_tx.clone(), resumed.clone());
+    let (agent_tx, cancel) = Agent::spawn_resumed(
+        config.clone(),
+        pwd.clone(),
+        event_tx.clone(),
+        resumed.clone(),
+    );
     if config.discord.enabled {
         rho::discord::spawn(config.clone(), agent_tx.clone(), event_tx.clone());
     }

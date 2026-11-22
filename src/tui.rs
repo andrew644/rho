@@ -1,6 +1,6 @@
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    DisableBracketedPaste, EnableBracketedPaste, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -227,7 +227,11 @@ fn assistant_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>
     let code_style = theme.code_style();
     let mut lines = Vec::new();
     let mut in_fence = false;
-    let src_lines: Vec<&str> = if text.is_empty() { vec![""] } else { text.lines().collect() };
+    let src_lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect()
+    };
     for src in src_lines {
         if src.trim_start().starts_with("```") {
             in_fence = !in_fence;
@@ -251,8 +255,8 @@ fn assistant_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const BUILTIN_COMMANDS: [&str; 12] = [
-    "compact", "exit", "help", "loop", "model", "name", "new", "pwd", "quit", "resume",
-    "session", "stop",
+    "compact", "exit", "help", "loop", "model", "name", "new", "pwd", "quit", "resume", "session",
+    "stop",
 ];
 
 fn expand_home(token: &str) -> String {
@@ -299,7 +303,10 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
             let chars: Vec<char> = word.chars().collect();
             let mut start = 0;
             while start + width < chars.len() {
-                lines.last_mut().unwrap().extend(&chars[start..start + width]);
+                lines
+                    .last_mut()
+                    .unwrap()
+                    .extend(&chars[start..start + width]);
                 lines.push(String::new());
                 start += width;
             }
@@ -554,10 +561,7 @@ impl App {
             return;
         }
         names.sort();
-        let cands: Vec<String> = names
-            .iter()
-            .map(|n| format!("/pwd {parent}{n}/"))
-            .collect();
+        let cands: Vec<String> = names.iter().map(|n| format!("/pwd {parent}{n}/")).collect();
         self.input = cands[0].clone();
         self.completion = if cands.len() == 1 {
             None
@@ -857,11 +861,7 @@ impl App {
         let rows = rows.max(1);
         let before: String = self.input.chars().take(self.cursor).collect();
         let cur_line = before.matches('\n').count();
-        let cur_col = before
-            .chars()
-            .rev()
-            .take_while(|c| *c != '\n')
-            .count();
+        let cur_col = before.chars().rev().take_while(|c| *c != '\n').count();
         let lines: Vec<&str> = self.input.split('\n').collect();
         let top = cur_line.saturating_sub(rows - 1);
         let bottom = (top + rows).min(lines.len());
@@ -907,10 +907,7 @@ impl App {
             return "idle".to_string();
         }
         let frame = SPINNER[self.spinner_frame % SPINNER.len()];
-        let elapsed = self
-            .turn_start
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+        let elapsed = self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         format!("{frame} {} {elapsed}s", self.status)
     }
 
@@ -1492,7 +1489,10 @@ mod tests {
         let entry = app.entries.iter().find(|e| e.kind == Kind::Tool).unwrap();
         assert_eq!(entry.text, "bash ls -la ✓");
         assert_eq!(entry.output.as_deref(), Some("ok"));
-        assert_eq!(app.entries.iter().filter(|e| e.kind == Kind::Tool).count(), 1);
+        assert_eq!(
+            app.entries.iter().filter(|e| e.kind == Kind::Tool).count(),
+            1
+        );
     }
 
     #[test]
@@ -1516,17 +1516,27 @@ mod tests {
         app.on_event(AgentEvent::ToolFinished {
             name: "bash".into(),
             is_error: false,
-            output: (1..=50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+            output: (1..=50)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         });
         let entry = app.entries.iter().find(|e| e.kind == Kind::Tool).unwrap();
         let lines = entry_lines(entry, 80, false, &Theme::new(ThemeName::Dark));
-        assert_eq!(lines.len(), TOOL_OUTPUT_LINES + 2, "header + 20 lines + note");
+        assert_eq!(
+            lines.len(),
+            TOOL_OUTPUT_LINES + 2,
+            "header + 20 lines + note"
+        );
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(texts[1], "  line 1");
-        assert!(texts[21].contains("+30 lines (Ctrl+O to expand)"), "{texts:#?}");
+        assert!(
+            texts[21].contains("+30 lines (Ctrl+O to expand)"),
+            "{texts:#?}"
+        );
         let expanded = entry_lines(entry, 80, true, &Theme::new(ThemeName::Dark));
         assert_eq!(expanded.len(), 51);
     }
@@ -1743,7 +1753,10 @@ mod wrap_tests {
 
     #[test]
     fn wraps_on_word_boundaries() {
-        assert_eq!(wrap_words("acknowledge this", 12), vec!["acknowledge", "this"]);
+        assert_eq!(
+            wrap_words("acknowledge this", 12),
+            vec!["acknowledge", "this"]
+        );
         assert_eq!(wrap_words("one two three", 20), vec!["one two three"]);
         assert_eq!(wrap_words("a b", 10), vec!["a b"]);
         assert_eq!(wrap_words("", 10), Vec::<String>::new());
@@ -1775,12 +1788,23 @@ mod wrap_tests {
 
     #[test]
     fn reasoning_entry_renders_as_one_block() {
-        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = super::App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec![],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         app.on_event(super::AgentEvent::ReasoningDelta("line one\n".into()));
         app.on_event(super::AgentEvent::ReasoningDelta("line two".into()));
         let pending = app.pending.as_ref().unwrap();
         assert_eq!(pending.text, "line one\nline two");
-        assert_eq!(entry_lines(pending, 40, false, &Theme::new(ThemeName::Dark)).len(), 2);
+        assert_eq!(
+            entry_lines(pending, 40, false, &Theme::new(ThemeName::Dark)).len(),
+            2
+        );
     }
 
     fn assistant(text: &str) -> Entry {
@@ -1805,10 +1829,7 @@ mod wrap_tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(
-            lines,
-            vec!["before", "    fn main() {}", "after"]
-        );
+        assert_eq!(lines, vec!["before", "    fn main() {}", "after"]);
     }
 
     #[test]
@@ -1829,10 +1850,7 @@ mod wrap_tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(
-            lines,
-            vec!["    code", "word word", "word word", "word"]
-        );
+        assert_eq!(lines, vec!["    code", "word word", "word word", "word"]);
     }
 }
 
@@ -1871,11 +1889,10 @@ mod draw_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = test_app();
         app.on_submit("/pwd", &tx);
-        assert!(
-            app.entries
-                .iter()
-                .any(|e| e.kind == Kind::Info && e.text.contains("pwd:"))
-        );
+        assert!(app
+            .entries
+            .iter()
+            .any(|e| e.kind == Kind::Info && e.text.contains("pwd:")));
         assert!(rx.try_recv().is_err());
         app.on_submit("/pwd ../elsewhere", &tx);
         match rx.try_recv().unwrap() {
@@ -1895,7 +1912,8 @@ mod draw_tests {
             Theme::new(ThemeName::Dark),
             Some("/state/sess.jsonl".to_string()),
         );
-        let text: String = app.entries
+        let text: String = app
+            .entries
             .iter()
             .map(|e| e.text.clone())
             .collect::<Vec<_>>()
@@ -1988,7 +2006,15 @@ mod scroll_tests {
 
     #[test]
     fn pages_vertically_not_horizontally() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -2028,7 +2054,15 @@ mod scroll_tests {
 
     #[test]
     fn scrolled_view_survives_streaming_output() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -2062,7 +2096,15 @@ mod scroll_tests {
 
     #[test]
     fn wheel_scroll_detaches_and_reattaches_follow() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         assert!(app.follow);
         app.scroll_by(3);
         assert!(!app.follow);
@@ -2086,7 +2128,15 @@ mod scroll_tests {
 
     #[test]
     fn scrollbar_appears_on_overflow_and_follows_scroll() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -2102,7 +2152,15 @@ mod scroll_tests {
 
     #[test]
     fn no_scrollbar_when_content_fits() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         app.push("short message".to_string(), Kind::User);
         let screen = render(&mut app, 80, 24);
         let col = right_column(&screen);
@@ -2184,7 +2242,15 @@ mod scroll_tests {
 
     #[test]
     fn long_lines_wrap_within_width() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         app.push("x".repeat(500), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
         for row in &screen {
@@ -2198,25 +2264,49 @@ mod scroll_tests {
 
     #[test]
     fn different_kinds_are_separated_by_blank_line() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         app.push("hello there".to_string(), Kind::User);
         app.push("a response".to_string(), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
-        let user_row = screen.iter().position(|l| l.contains("hello there")).unwrap();
-        let resp_row = screen.iter().position(|l| l.contains("a response")).unwrap();
-        assert_eq!(resp_row, user_row + 2, "blank line between turns: {screen:#?}");
+        let user_row = screen
+            .iter()
+            .position(|l| l.contains("hello there"))
+            .unwrap();
+        let resp_row = screen
+            .iter()
+            .position(|l| l.contains("a response"))
+            .unwrap();
+        assert_eq!(
+            resp_row,
+            user_row + 2,
+            "blank line between turns: {screen:#?}"
+        );
         assert_eq!(screen[user_row + 1].trim(), "");
     }
 
     #[test]
     fn ctrl_r_toggles_reasoning_visibility() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000, Theme::new(ThemeName::Dark), None);
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "m".into(),
+            vec!["m".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
         app.push("because reasons".to_string(), Kind::Reasoning);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let key = |code| {
-            crossterm::event::KeyEvent::new(code, KeyModifiers::CONTROL)
-        };
+        let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::CONTROL);
         assert!(render(&mut app, 80, 24)
             .iter()
             .any(|l| l.contains("because reasons")));
