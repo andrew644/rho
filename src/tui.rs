@@ -13,6 +13,7 @@ use ratatui::Frame;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{AgentCommand, AgentEvent};
@@ -189,6 +190,23 @@ fn assistant_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn fmt_tokens(n: usize) -> String {
+    let (v, unit) = if n >= 1_000_000 {
+        (n as f64 / 1_000_000.0, 'M')
+    } else if n >= 1000 {
+        (n as f64 / 1000.0, 'k')
+    } else {
+        return n.to_string();
+    };
+    let mut num = format!("{v:.1}");
+    if let Some(stripped) = num.strip_suffix(".0") {
+        num = stripped.to_string();
+    }
+    format!("{num}{unit}")
+}
+
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = vec![String::new()];
@@ -291,6 +309,8 @@ pub struct App {
     expand_tools: bool,
     pending_tool: Option<usize>,
     status: String,
+    spinner_frame: usize,
+    turn_start: Option<Instant>,
     loop_status: Option<String>,
     busy: bool,
     current_tool: Option<String>,
@@ -299,6 +319,7 @@ pub struct App {
     last_rendered_lines: usize,
     cwd: PathBuf,
     model: String,
+    context_window: u32,
     known_models: Vec<String>,
     templates: Vec<Template>,
     session_list: Vec<SessionInfo>,
@@ -314,6 +335,7 @@ impl App {
         model: String,
         known_models: Vec<String>,
         templates: Vec<Template>,
+        context_window: u32,
     ) -> Self {
         Self {
             entries: vec![Entry {
@@ -331,6 +353,8 @@ impl App {
             expand_tools: false,
             pending_tool: None,
             status: "idle".to_string(),
+            spinner_frame: 0,
+            turn_start: None,
             loop_status: None,
             busy: false,
             current_tool: None,
@@ -339,6 +363,7 @@ impl App {
             last_rendered_lines: 0,
             cwd,
             model,
+            context_window,
             known_models,
             templates,
             session_list: Vec::new(),
@@ -619,11 +644,73 @@ impl App {
     }
 
     fn update_status(&mut self) {
-        if let Some(tool) = &self.current_tool {
-            self.status = format!("running {tool}…");
-        } else if self.busy && self.status == "idle" {
-            self.status = "thinking…".to_string();
+        if !self.busy {
+            self.turn_start = None;
+            self.status = "idle".to_string();
+            return;
         }
+        if self.turn_start.is_none() {
+            self.turn_start = Some(Instant::now());
+        }
+        if let Some(tool) = &self.current_tool {
+            self.status = format!("running {tool}");
+        } else if self.status == "idle" {
+            self.status = "thinking".to_string();
+        }
+    }
+
+    fn status_line(&self) -> String {
+        if !self.busy {
+            return "idle".to_string();
+        }
+        let frame = SPINNER[self.spinner_frame % SPINNER.len()];
+        let elapsed = self
+            .turn_start
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        format!("{frame} {} {elapsed}s", self.status)
+    }
+
+    fn context_usage(&self) -> (String, Color) {
+        let pct = if self.context_window > 0 {
+            self.est_tokens as f64 / self.context_window as f64 * 100.0
+        } else {
+            0.0
+        };
+        let usage = format!(
+            "~{}/{} ({:.1}%)",
+            fmt_tokens(self.est_tokens),
+            fmt_tokens(self.context_window as usize),
+            pct
+        );
+        let color = if pct >= 90.0 {
+            Color::Red
+        } else if pct >= 70.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        (usage, color)
+    }
+
+    fn footer_title(&self) -> Line<'static> {
+        let cwd_name = self
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.cwd.display().to_string());
+        let ident = match &self.session_name {
+            Some(name) if !name.is_empty() => format!("{name} · {cwd_name}"),
+            _ => cwd_name,
+        };
+        let (usage, usage_color) = self.context_usage();
+        Line::from(vec![
+            Span::styled(format!(" {ident} · "), Style::default().fg(Color::DarkGray)),
+            Span::raw(self.model.clone()),
+            Span::raw(format!(" · {} · ", self.status_line())),
+            Span::styled(usage, Style::default().fg(usage_color)),
+            Span::raw(" "),
+        ])
     }
 
     fn submit_prompt(
@@ -637,7 +724,7 @@ impl App {
         self.scroll_from_bottom = 0;
         self.push(display.to_string(), Kind::User);
         self.busy = true;
-        self.status = "thinking…".to_string();
+        self.status = "thinking".to_string();
         let _ = agent.send(AgentCommand::Prompt { text });
     }
 
@@ -693,7 +780,7 @@ impl App {
                 Ok(spec) => {
                     self.history.push(format!("/loop {args}"));
                     self.busy = true;
-                    self.status = "looping…".to_string();
+                    self.status = "looping".to_string();
                     let _ = agent.send(AgentCommand::Loop { spec });
                 }
                 Err(e) => self.push(e, Kind::Error),
@@ -705,7 +792,7 @@ impl App {
                     None => "/compact".to_string(),
                 });
                 self.busy = true;
-                self.status = "compacting…".to_string();
+                self.status = "compacting".to_string();
                 let _ = agent.send(AgentCommand::Compact { instructions });
             }
             Some(InputAction::Command(Command::New)) => {
@@ -865,10 +952,23 @@ impl App {
             );
         }
 
-        let input_block = Block::default().borders(Borders::ALL).title(format!(
-            " {} · ~{} tok · {} ",
-            self.model, self.est_tokens, self.status
-        ));
+        let queued = self.busy && !self.input.is_empty();
+        let mut title = self.footer_title();
+        if queued {
+            title.push_span(Span::styled(
+                "· ⏎ queues",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        let border_style = if self.busy {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_style);
         let inner = input_block.inner(chunks.2);
         frame.render_widget(input_block, chunks.2);
         let prompt = Paragraph::new(Span::styled(format!("❯ {}", self.input), Style::default()));
@@ -905,6 +1005,7 @@ pub struct TuiOptions {
     pub model: String,
     pub known_models: Vec<String>,
     pub templates: Vec<Template>,
+    pub context_window: u32,
 }
 
 async fn run_inner(
@@ -914,10 +1015,15 @@ async fn run_inner(
     events: &mut broadcast::Receiver<AgentEvent>,
     opts: TuiOptions,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(opts.cwd, opts.model, opts.known_models, opts.templates);
+    let mut app = App::new(
+        opts.cwd,
+        opts.model,
+        opts.known_models,
+        opts.templates,
+        opts.context_window,
+    );
     let mut keys = crossterm::event::EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
-    let mut ticks = 0u64;
     loop {
         terminal.draw(|frame| app.draw(frame, frame.area()))?;
         tokio::select! {
@@ -944,14 +1050,7 @@ async fn run_inner(
                 }
             }
             _ = ticker.tick() => {
-                ticks += 1;
-                if app.busy && ticks.is_multiple_of(5) {
-                    app.status.push('.');
-                    if app.status.len() > app.status.rfind('…').map(|i| i + 4).unwrap_or(0) + 3 {
-                        let base: String = app.status.chars().take_while(|c| *c != '.').collect();
-                        app.status = base;
-                    }
-                }
+                app.spinner_frame += 1;
             }
         }
     }
@@ -968,6 +1067,7 @@ mod tests {
             "test-model".into(),
             vec!["test-model".into()],
             vec![],
+            128_000,
         )
     }
 
@@ -1063,6 +1163,7 @@ mod tests {
                 argument_hint: None,
                 body: "hello $1".into(),
             }],
+            128_000,
         );
         app.on_submit("/greet world", &tx);
         match rx.try_recv().unwrap() {
@@ -1232,7 +1333,7 @@ mod wrap_tests {
 
     #[test]
     fn reasoning_entry_renders_as_one_block() {
-        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![]);
+        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![], 128_000);
         app.on_event(super::AgentEvent::ReasoningDelta("line one\n".into()));
         app.on_event(super::AgentEvent::ReasoningDelta("line two".into()));
         let pending = app.pending.as_ref().unwrap();
@@ -1304,6 +1405,7 @@ mod draw_tests {
             "test-model".into(),
             vec!["test-model".into()],
             vec![],
+            128_000,
         )
     }
 
@@ -1361,6 +1463,16 @@ mod scroll_tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    fn test_app() -> App {
+        App::new(
+            PathBuf::from("/tmp"),
+            "test-model".into(),
+            vec!["test-model".into()],
+            vec![],
+            128_000,
+        )
+    }
+
     fn render(app: &mut App, w: u16, h: u16) -> Vec<String> {
         let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| app.draw(f, f.area())).unwrap();
@@ -1376,7 +1488,7 @@ mod scroll_tests {
 
     #[test]
     fn pages_vertically_not_horizontally() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1416,7 +1528,7 @@ mod scroll_tests {
 
     #[test]
     fn scrolled_view_survives_streaming_output() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1450,7 +1562,7 @@ mod scroll_tests {
 
     #[test]
     fn wheel_scroll_detaches_and_reattaches_follow() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         assert!(app.follow);
         app.scroll_by(3);
         assert!(!app.follow);
@@ -1474,7 +1586,7 @@ mod scroll_tests {
 
     #[test]
     fn scrollbar_appears_on_overflow_and_follows_scroll() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1490,7 +1602,7 @@ mod scroll_tests {
 
     #[test]
     fn no_scrollbar_when_content_fits() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         app.push("short message".to_string(), Kind::User);
         let screen = render(&mut app, 80, 24);
         let col = right_column(&screen);
@@ -1501,8 +1613,60 @@ mod scroll_tests {
     }
 
     #[test]
+    fn status_line_uses_spinner_and_elapsed() {
+        let mut app = test_app();
+        assert_eq!(app.status_line(), "idle");
+        app.busy = true;
+        app.status = "thinking".to_string();
+        app.turn_start = Some(std::time::Instant::now());
+        app.spinner_frame = 2;
+        let line = app.status_line();
+        assert!(line.starts_with('⠹'), "{line}");
+        assert!(line.contains("thinking"), "{line}");
+        assert!(line.ends_with("0s"), "{line}");
+    }
+
+    #[test]
+    fn context_usage_shows_tokens_and_percent() {
+        let mut app = test_app();
+        app.est_tokens = 478;
+        app.context_window = 128_000;
+        let (usage, color) = app.context_usage();
+        assert_eq!(usage, "~478/128k (0.4%)");
+        assert_eq!(color, Color::Green);
+        app.est_tokens = 100_000;
+        let (usage, color) = app.context_usage();
+        assert_eq!(usage, "~100k/128k (78.1%)");
+        assert_eq!(color, Color::Yellow);
+        app.est_tokens = 120_000;
+        let (_, color) = app.context_usage();
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn fmt_tokens_compacts_large_values() {
+        assert_eq!(fmt_tokens(478), "478");
+        assert_eq!(fmt_tokens(128_000), "128k");
+        assert_eq!(fmt_tokens(4096), "4.1k");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn footer_shows_session_name_and_cwd() {
+        let mut app = test_app();
+        let title = app.footer_title();
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("tmp"), "{text}");
+        app.session_name = Some("my-work".to_string());
+        let title = app.footer_title();
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("my-work · tmp"), "{text}");
+        assert!(text.contains("test-model"), "{text}");
+    }
+
+    #[test]
     fn long_lines_wrap_within_width() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         app.push("x".repeat(500), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
         for row in &screen {
@@ -1516,7 +1680,7 @@ mod scroll_tests {
 
     #[test]
     fn different_kinds_are_separated_by_blank_line() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         app.push("hello there".to_string(), Kind::User);
         app.push("a response".to_string(), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
@@ -1528,7 +1692,7 @@ mod scroll_tests {
 
     #[test]
     fn ctrl_r_toggles_reasoning_visibility() {
-        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![], 128_000);
         app.push("because reasons".to_string(), Kind::Reasoning);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));

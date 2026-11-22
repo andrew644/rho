@@ -147,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
         model: config.model.id.clone(),
         known_models: known,
         templates: loaded_templates,
+        context_window: config.context_window,
     };
     rho::tui::run(agent_tx, cancel, event_rx, tui).await
 }

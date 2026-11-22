@@ -181,16 +181,16 @@ Improvements identified from a hands-on review of the running TUI.
 
 ### Status bar / footer
 
-5. [ ] **Real spinner + elapsed time** — replace literal `…….` dots with
+5. [x] **Real spinner + elapsed time** — replace literal `…….` dots with
    animated frames (`⠋⠙⠹⠸…`) and show elapsed seconds for the current turn.
-6. [ ] **Context usage as percent** — show `~478/128k (0.4%)` instead of a bare
+6. [x] **Context usage as percent** — show `~478/128k (0.4%)` instead of a bare
    token count; shift color yellow→red as auto-compaction approaches.
-7. [ ] **Footer identity info** — include session name (after `/name`,
+7. [x] **Footer identity info** — include session name (after `/name`,
    `--continue`) and cwd basename so side-by-side agents are distinguishable.
 
 ### Input UX
 
-8. [ ] **Busy-state input affordance** — dim the input border or show
+8. [x] **Busy-state input affordance** — dim the input border or show
    "queued" while the agent is running so it's clear what Enter will do.
 9. [ ] **Slash-command autocomplete** — typing `/` + Tab (or arrows) filters
    and completes built-in commands and template names.
