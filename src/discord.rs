@@ -37,18 +37,87 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-pub fn should_respond(author: &Value, channel_id: &str, allowed_user_id: &str) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ignore {
+    FromBot,
+    DisallowedUser(String),
+    NoText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inbound {
+    Prompted { channel_id: String, text: String },
+    Ignored(Ignore),
+}
+
+/// Any non-bot message from the allowed user is a prompt, in DMs and in server
+/// channels alike. `channel_id` in the config only says where answers to
+/// prompts with no Discord origin go, so no channel has to be configured for
+/// the bot to hear it.
+pub fn accept_message(d: &Value, allowed_user_id: &str) -> Inbound {
+    let author = &d["author"];
     if author.get("bot").and_then(|b| b.as_bool()).unwrap_or(false) {
-        return false;
+        return Inbound::Ignored(Ignore::FromBot);
     }
-    if !allowed_user_id.is_empty() {
-        let id = author.get("id").and_then(|i| i.as_str()).unwrap_or("");
-        if id != allowed_user_id {
-            return false;
+    let user_id = author.get("id").and_then(|i| i.as_str()).unwrap_or("");
+    if !allowed_user_id.is_empty() && user_id != allowed_user_id {
+        return Inbound::Ignored(Ignore::DisallowedUser(user_id.to_string()));
+    }
+    let text = d["content"].as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return Inbound::Ignored(Ignore::NoText);
+    }
+    Inbound::Prompted {
+        channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
+        text: text.to_string(),
+    }
+}
+
+pub fn is_guild_message(d: &Value) -> bool {
+    !d["guild_id"].is_null()
+}
+
+/// One-line hints for the failures that otherwise look like "the bot is
+/// connected but ignores me"; each is printed once per gateway session.
+#[derive(Debug, Default)]
+pub struct Notices {
+    missing_text: bool,
+    disallowed_user: bool,
+}
+
+impl Notices {
+    pub fn notice(&mut self, inbound: &Inbound, guild: bool) -> Option<String> {
+        match inbound {
+            Inbound::Ignored(Ignore::NoText) if guild && !self.missing_text => {
+                self.missing_text = true;
+                Some(
+                    "discord: a server message arrived with no text, so Discord is not applying \
+                     the Message Content Intent for this session; switch it on under Bot -> \
+                     Privileged Gateway Intents in the developer portal"
+                        .to_string(),
+                )
+            }
+            Inbound::Ignored(Ignore::DisallowedUser(id)) if !self.disallowed_user => {
+                self.disallowed_user = true;
+                Some(format!(
+                    "discord: ignoring messages from user id {id}; it does not match \
+                     allowed_user_id (clear allowed_user_id to accept anyone)"
+                ))
+            }
+            _ => None,
         }
     }
-    let _ = channel_id;
-    true
+}
+
+pub fn guild_summary(d: &Value) -> String {
+    let name = d["name"].as_str().unwrap_or("unnamed");
+    let id = d["id"].as_str().unwrap_or("?");
+    let state = if d["unavailable"].as_bool().unwrap_or(false) {
+        "unavailable"
+    } else {
+        "available"
+    };
+    format!("discord: server \"{name}\" ({id}) {state}")
 }
 
 pub fn chunk_message(text: &str) -> Vec<String> {
@@ -384,6 +453,12 @@ pub fn spawn(
     if config.discord.bot_token.trim().is_empty() {
         eprintln!("discord: bot_token is empty, replies will be rejected with 401");
     }
+    if config.discord.allowed_user_id.trim().is_empty() {
+        eprintln!(
+            "discord: allowed_user_id is empty, so anyone who can DM the bot or who shares a \
+             server with it can drive the agent; set discord.allowed_user_id to lock it down"
+        );
+    }
     let router = Arc::new(Router::new(&config.discord.channel_id));
     let (outbox_tx, outbox_rx) = mpsc::channel::<Posted>(OUTBOX_DEPTH);
     tokio::spawn(reply_relay(events.subscribe(), outbox_tx, router.clone()));
@@ -494,9 +569,10 @@ async fn gateway_session(
         send_json(&mut ws, &identify).await?;
     }
 
-    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut ws, session)).await;
+    let handshake =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut ws, session, intents)).await;
     match handshake {
-        Ok(Ok(status)) => eprintln!("discord gateway {status}"),
+        Ok(Ok(ready)) => eprintln!("discord gateway {}", ready.summary()),
         Ok(Err(error)) => return Err(error),
         Err(_) => {
             return Err(GatewayError::new(
@@ -510,6 +586,7 @@ async fn gateway_session(
     let first = first_beat_delay(interval, entropy());
     let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + first, interval);
     let mut awaiting_ack = false;
+    let mut notices = Notices::default();
 
     loop {
         tokio::select! {
@@ -539,10 +616,18 @@ async fn gateway_session(
                                     if resumable { Reconnect::Resume } else { Reconnect::Fresh },
                                 ));
                             }
+                            GatewayOp::Dispatch if value["t"].as_str() == Some("GUILD_CREATE") => {
+                                eprintln!("{}", guild_summary(&value["d"]));
+                            }
                             GatewayOp::Dispatch
                                 if value["t"].as_str() == Some("MESSAGE_CREATE") =>
                             {
-                                route_message(&config.discord, &value["d"], agent_tx, router);
+                                let inbound =
+                                    route_message(&config.discord, &value["d"], agent_tx, router);
+                                let guild = is_guild_message(&value["d"]);
+                                if let Some(note) = notices.notice(&inbound, guild) {
+                                    eprintln!("{note}");
+                                }
                             }
                             _ => continue,
                         }
@@ -563,7 +648,40 @@ fn reconnect_after_connect(want_resume: bool) -> Reconnect {
     }
 }
 
-async fn handshake(ws: &mut Ws, session: &mut GatewaySession) -> Gw<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyInfo {
+    pub resumed: bool,
+    pub requested_intents: u64,
+    pub granted_intents: Option<u64>,
+}
+
+impl ReadyInfo {
+    /// Says out loud whether Discord actually granted the privileged intent, so
+    /// a portal setting that was not saved (or a session that already degraded)
+    /// is visible instead of looking like a bot that ignores the server.
+    pub fn summary(&self) -> String {
+        let mut status = if self.resumed {
+            "resumed session".to_string()
+        } else {
+            "identified".to_string()
+        };
+        let Some(granted) = self.granted_intents else {
+            return status;
+        };
+        let requested = self.requested_intents & GUILD_MESSAGE_CONTENT != 0;
+        let content = if granted & GUILD_MESSAGE_CONTENT != 0 {
+            "message content granted"
+        } else if requested {
+            "WARNING: Discord did not grant the Message Content Intent, server text is empty"
+        } else {
+            "rho is not requesting the Message Content Intent, server text is empty"
+        };
+        status.push_str(&format!(" (intents {:#06x}, {content})", granted));
+        status
+    }
+}
+
+async fn handshake(ws: &mut Ws, session: &mut GatewaySession, intents: u64) -> Gw<ReadyInfo> {
     loop {
         let value: Value = read_json(ws).await?;
         if let Some(seq) = value["s"].as_u64() {
@@ -592,10 +710,18 @@ async fn handshake(ws: &mut Ws, session: &mut GatewaySession) -> Gw<String> {
                     .as_str()
                     .filter(|url| !url.is_empty())
                     .map(|url| url.to_string());
-                return Ok("identified".to_string());
+                return Ok(ReadyInfo {
+                    resumed: false,
+                    requested_intents: intents,
+                    granted_intents: value["d"]["intents"].as_u64(),
+                });
             }
             GatewayOp::Dispatch if value["t"].as_str() == Some("RESUMED") => {
-                return Ok("resumed session".to_string());
+                return Ok(ReadyInfo {
+                    resumed: true,
+                    requested_intents: intents,
+                    granted_intents: None,
+                });
             }
             _ => continue,
         }
@@ -607,28 +733,17 @@ fn route_message(
     d: &Value,
     agent_tx: &mpsc::UnboundedSender<AgentCommand>,
     router: &Router,
-) {
-    let channel_id = d["channel_id"].as_str().unwrap_or("");
-    let relevant =
-        config.channel_id.is_empty() || config.channel_id == channel_id || d["guild_id"].is_null();
-    if !relevant {
-        return;
+) -> Inbound {
+    let inbound = accept_message(d, &config.allowed_user_id);
+    if let Inbound::Prompted { channel_id, text } = &inbound {
+        if agent_tx
+            .send(AgentCommand::Prompt { text: text.clone() })
+            .is_ok()
+        {
+            router.expect_reply(channel_id);
+        }
     }
-    if !should_respond(&d["author"], channel_id, &config.allowed_user_id) {
-        return;
-    }
-    let content = d["content"].as_str().unwrap_or("").trim();
-    if content.is_empty() {
-        return;
-    }
-    if agent_tx
-        .send(AgentCommand::Prompt {
-            text: content.to_string(),
-        })
-        .is_ok()
-    {
-        router.expect_reply(channel_id);
-    }
+    inbound
 }
 
 async fn heartbeat(ws: &mut Ws, seq: u64) -> Gw<()> {
@@ -833,14 +948,129 @@ mod tests {
         }
     }
 
+    fn prompted(channel_id: &str, text: &str) -> Inbound {
+        Inbound::Prompted {
+            channel_id: channel_id.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    fn message(channel_id: &str, content: &str, author: Value) -> Value {
+        json!({ "channel_id": channel_id, "content": content, "author": author })
+    }
+
     #[test]
     fn ignores_bots_and_wrong_users() {
-        let bot = json!({"bot": true, "id": "1"});
-        let user = json!({"bot": false, "id": "42"});
-        assert!(!should_respond(&bot, "c", ""));
-        assert!(should_respond(&user, "c", ""));
-        assert!(should_respond(&user, "c", "42"));
-        assert!(!should_respond(&user, "c", "99"));
+        let bot = message("c", "hello", json!({"bot": true, "id": "1"}));
+        let user = message("c", "hello", json!({"bot": false, "id": "42"}));
+        assert_eq!(accept_message(&bot, ""), Inbound::Ignored(Ignore::FromBot));
+        assert_eq!(
+            accept_message(&user, "99"),
+            Inbound::Ignored(Ignore::DisallowedUser("42".to_string()))
+        );
+        assert_eq!(accept_message(&user, "42"), prompted("c", "hello"));
+        assert_eq!(accept_message(&user, ""), prompted("c", "hello"));
+    }
+
+    #[test]
+    fn every_channel_reaches_the_agent() {
+        let dm = json!({"channel_id": "7", "content": "hi", "author": {"id": "42"}});
+        let server = json!({
+            "channel_id": "9", "guild_id": "1", "content": "build it",
+            "author": {"id": "42"}
+        });
+        assert_eq!(accept_message(&dm, "42"), prompted("7", "hi"));
+        assert_eq!(accept_message(&server, "42"), prompted("9", "build it"));
+        assert!(!is_guild_message(&dm));
+        assert!(is_guild_message(&server));
+    }
+
+    #[test]
+    fn missing_server_text_is_blamed_on_the_intent() {
+        let guild = json!({
+            "channel_id": "9", "guild_id": "1", "content": "",
+            "author": {"id": "42"}
+        });
+        let dm = json!({"channel_id": "7", "content": "", "author": {"id": "42"}});
+
+        let mut notices = Notices::default();
+        let note = notices
+            .notice(&accept_message(&guild, "42"), is_guild_message(&guild))
+            .unwrap();
+        assert!(note.contains("Message Content Intent"));
+        assert!(notices
+            .notice(&accept_message(&guild, "42"), true)
+            .is_none());
+        assert!(notices
+            .notice(&accept_message(&dm, "42"), is_guild_message(&dm))
+            .is_none());
+    }
+
+    #[test]
+    fn an_unknown_user_is_reported_once_with_its_id() {
+        let stranger = json!({
+            "channel_id": "9", "guild_id": "1", "content": "help",
+            "author": {"id": "777"}
+        });
+        let mut notices = Notices::default();
+        let note = notices
+            .notice(&accept_message(&stranger, "42"), true)
+            .unwrap();
+        assert!(note.contains("777"));
+        assert!(note.contains("allowed_user_id"));
+        assert!(notices
+            .notice(&accept_message(&stranger, "42"), true)
+            .is_none());
+    }
+
+    #[test]
+    fn accepted_messages_produce_no_notice() {
+        let mut notices = Notices::default();
+        assert!(notices.notice(&prompted("9", "build it"), true).is_none());
+        assert!(notices
+            .notice(&Inbound::Ignored(Ignore::FromBot), false)
+            .is_none());
+    }
+
+    #[test]
+    fn servers_are_listed_with_their_state() {
+        assert_eq!(
+            guild_summary(&json!({"id": "1", "name": "Work"})),
+            "discord: server \"Work\" (1) available"
+        );
+        assert_eq!(
+            guild_summary(&json!({"id": "1", "unavailable": true})),
+            "discord: server \"unnamed\" (1) unavailable"
+        );
+    }
+
+    #[test]
+    fn ready_says_whether_discord_granted_the_intent() {
+        let granted = ReadyInfo {
+            resumed: false,
+            requested_intents: INTENTS,
+            granted_intents: Some(INTENTS),
+        };
+        assert!(granted.summary().contains("message content granted"));
+
+        let denied = ReadyInfo {
+            granted_intents: Some(INTENTS & !GUILD_MESSAGE_CONTENT),
+            ..granted.clone()
+        };
+        assert!(denied.summary().contains("did not grant"));
+
+        let degraded = ReadyInfo {
+            requested_intents: INTENTS & !GUILD_MESSAGE_CONTENT,
+            ..denied.clone()
+        };
+        assert!(degraded.summary().contains("not requesting"));
+
+        let resumed = ReadyInfo {
+            resumed: true,
+            granted_intents: None,
+            ..granted
+        };
+        assert_eq!(resumed.summary(), "resumed session");
     }
 
     #[test]
@@ -1135,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_only_relevant_messages() {
+    fn routes_messages_from_any_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let router = Router::new("7");
         let message = json!({
@@ -1143,19 +1373,31 @@ mod tests {
             "author": {"bot": false, "id": "42"}
         });
 
-        route_message(&config("9"), &message, &tx, &router);
+        assert_eq!(
+            route_message(&config("9"), &message, &tx, &router),
+            prompted("9", "build it")
+        );
         assert_eq!(
             rx.try_recv().unwrap().text_or_debug(),
             "build it".to_string()
         );
 
-        route_message(&config("7"), &message, &tx, &router);
-        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            route_message(&config("7"), &message, &tx, &router),
+            prompted("9", "build it")
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().text_or_debug(),
+            "build it".to_string()
+        );
 
         let dm = json!({
             "channel_id": "9", "content": "dm prompt", "author": {"bot": false, "id": "42"}
         });
-        route_message(&config("7"), &dm, &tx, &router);
+        assert_eq!(
+            route_message(&config("7"), &dm, &tx, &router),
+            prompted("9", "dm prompt")
+        );
         assert_eq!(
             rx.try_recv().unwrap().text_or_debug(),
             "dm prompt".to_string()
@@ -1165,7 +1407,10 @@ mod tests {
             allowed_user_id: "1".to_string(),
             ..config("9")
         };
-        route_message(&restricted, &message, &tx, &router);
+        assert_eq!(
+            route_message(&restricted, &message, &tx, &router),
+            Inbound::Ignored(Ignore::DisallowedUser("42".to_string()))
+        );
         assert!(rx.try_recv().is_err());
     }
 
@@ -1197,23 +1442,23 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let router = Router::new("7");
 
-        let other_channel = json!({
-            "channel_id": "9", "guild_id": "1", "content": "nope",
-            "author": {"bot": false, "id": "42"}
-        });
-        route_message(&config("7"), &other_channel, &tx, &router);
-
         let blank = json!({
-            "channel_id": "77", "guild_id": "1", "content": "",
+            "channel_id": "77", "guild_id": "1", "content": "   ",
             "author": {"bot": false, "id": "42"}
         });
-        route_message(&config("7"), &blank, &tx, &router);
+        assert_eq!(
+            route_message(&config("7"), &blank, &tx, &router),
+            Inbound::Ignored(Ignore::NoText)
+        );
 
         let from_bot = json!({
             "channel_id": "77", "guild_id": "1", "content": "echo",
             "author": {"bot": true, "id": "42"}
         });
-        route_message(&config("7"), &from_bot, &tx, &router);
+        assert_eq!(
+            route_message(&config("7"), &from_bot, &tx, &router),
+            Inbound::Ignored(Ignore::FromBot)
+        );
 
         assert!(rx.try_recv().is_err());
         assert_eq!(router.take().as_deref(), Some("7"));

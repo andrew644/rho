@@ -197,15 +197,21 @@ loop:
   move: `4004/4010/4011/4014` stop the bridge, `4007/4008/4009/4012`
   re-identify, anything else resumes. Wait between attempts doubles from 1 s
   to 60 s with jitter and resets once a session identifies.
-- Incoming `MESSAGE_CREATE` from the configured channel (or DM) from the
-  allowed user: text is enqueued as an agent prompt and the channel becomes the
-  reply target, so answers go back where the question was asked; the
-  configured `channel_id` is the fallback for prompts with no Discord origin
-  (TUI, `rho -p`). Agent replies (final assistant text, split at 2000 chars)
-  go to a bounded outbox drained by a worker that POSTs
-  `/channels/{id}/messages` with `Authorization: Bot <token>` (Discord rejects
-  `Bearer` for bot tokens with `401`) at 4 messages per 5 s, so chunk bursts
-  stay under Discord's per-channel limit.
+- Incoming `MESSAGE_CREATE` from the allowed user, in any DM or server channel
+  the bot can see (`channel_id` never filters inbound messages): text is
+  enqueued as an agent prompt and the channel becomes the reply target, so
+  answers go back where the question was asked; the configured `channel_id` is
+  the fallback for prompts with no Discord origin (TUI, `rho -p`). Agent
+  replies (final assistant text, split at 2000 chars) go to a bounded outbox
+  drained by a worker that POSTs `/channels/{id}/messages` with
+  `Authorization: Bot <token>` (Discord rejects `Bearer` for bot tokens with
+  `401`) at 4 messages per 5 s, so chunk bursts stay under Discord's
+  per-channel limit.
+- Silence is explained rather than guessed at: `READY` prints the intents
+  Discord granted and warns when it did not grant the privileged one, each
+  `GUILD_CREATE` prints the server name/id and whether it is available, and
+  the first allowed server message that arrives with empty `content` and the
+  first author rejected by `allowed_user_id` each print a one-line hint.
 - A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,
   5xx waits a second; up to 3 attempts per chunk. Other 4xx (bad token,
   missing permissions) are not retried. When the outbox is full the newest

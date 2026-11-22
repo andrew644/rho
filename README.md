@@ -25,8 +25,8 @@ model:
 # discord:
 #   enabled: true
 #   bot_token: "..."
-#   channel_id: "..."        # optional; where TUI prompts are mirrored
-#   allowed_user_id: "..."   # optional; restrict who may drive the agent
+#   channel_id: "..."        # optional; where prompts with no Discord origin go
+#   allowed_user_id: "..."   # your Discord user id; restricts who may drive the agent
 # loop_config:
 #   max_turns_per_run: 64
 ```
@@ -149,8 +149,10 @@ to evaluate the condition (YES/NO) after every iteration.
 ### Discord remote control
 
 With `discord.enabled`, rho connects to the Discord gateway as a bot and
-pipes messages from the configured channel (or DMs) into the same serial
-prompt queue as the TUI; final answers are posted back, split at 2000 chars.
+pipes every message it can see — DMs and any server channel it is a member
+of — into the same serial prompt queue as the TUI; final answers are posted
+back, split at 2000 chars. No channel has to be configured for the bot to
+hear you.
 
 Replies go back to the channel the question came from: DM the bot and the
 answer appears in the DM, post in a server channel and it appears in that
@@ -158,6 +160,11 @@ channel. `channel_id` is only the fallback destination, used for prompts that
 have no Discord origin (typed in the TUI or `rho -p`); leave it empty and
 those are not mirrored to Discord, while messages sent to the bot still get
 answered where they were sent.
+
+Because a server channel needs no configuration, set `allowed_user_id`: while
+it is empty anyone who can DM the bot or who shares a server with it can drive
+the agent, and rho warns about that at startup. Messages from bots are always
+ignored.
 
 Reading text in a **server** channel needs the privileged *Message Content
 Intent*: without it Discord delivers `MESSAGE_CREATE` for server channels with
@@ -167,8 +174,20 @@ the bot under *Bot → Privileged Gateway Intents → Message Content Intent* in
 the developer portal. When the intent is not granted the gateway closes the
 `IDENTIFY` with `4013 Disallowed intents`; rho drops the intent, prints a
 warning and reconnects, so DMs keep working but server channels stay unread.
-`allowed_user_id` restricts who may drive the agent, and messages from bots
-are always ignored.
+
+When server messages still seem to vanish, stderr says why:
+
+- `discord gateway identified (intents 0x1900, message content granted)` —
+  Discord confirms the intent on the live session; `WARNING: Discord did not
+  grant the Message Content Intent` means the portal switch is off (or was
+  saved after this session identified, so restart rho).
+- `discord: server "Name" (id) available` — one line per server the bot is in
+  and can read; a missing server means the bot was never invited there or
+  lacks *View Channel*.
+- `discord: a server message arrived with no text ...` — the message reached
+  rho with an empty `content`, so the intent is not being applied.
+- `discord: ignoring messages from user id ...` — the author does not match
+  `allowed_user_id`.
 
 Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
 retried after the `Retry-After` Discord reports (up to 3 attempts); a full
