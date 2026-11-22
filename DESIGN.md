@@ -194,8 +194,9 @@ loop:
 - Incoming `MESSAGE_CREATE` from the configured channel (or DM) from the
   allowed user: text is enqueued as an agent prompt; agent replies
   (final assistant text, split at 2000 chars) go to a bounded outbox drained
-  by a worker that POSTs `/channels/{id}/messages` at 4 messages per 5 s, so
-  chunk bursts stay under Discord's per-channel limit.
+  by a worker that POSTs `/channels/{id}/messages` with `Authorization: Bot
+  <token>` (Discord rejects `Bearer` for bot tokens with `401`) at 4 messages
+  per 5 s, so chunk bursts stay under Discord's per-channel limit.
 - A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,
   5xx waits a second; up to 3 attempts per chunk. Other 4xx (bad token,
   missing permissions) are not retried. When the outbox is full the newest

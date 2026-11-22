@@ -303,6 +303,9 @@ pub fn spawn(
     if config.discord.channel_id.is_empty() {
         eprintln!("discord: channel_id is empty, replies will not be delivered");
     }
+    if config.discord.bot_token.trim().is_empty() {
+        eprintln!("discord: bot_token is empty, replies will be rejected with 401");
+    }
     let (outbox_tx, outbox_rx) = mpsc::channel::<String>(OUTBOX_DEPTH);
     tokio::spawn(reply_relay(events.subscribe(), outbox_tx));
     tokio::spawn(Outbox::new(config.discord.clone(), outbox_rx).run());
@@ -631,19 +634,29 @@ struct RestPoster {
     config: DiscordConfig,
 }
 
+pub fn send_url(channel_id: &str) -> String {
+    format!(
+        "https://discord.com/api/v10/channels/{}/messages",
+        channel_id.trim()
+    )
+}
+
+pub fn auth_header(bot_token: &str) -> String {
+    format!("Bot {}", bot_token.trim())
+}
+
 impl Poster for RestPoster {
     async fn post(&self, text: &str) -> Result<(), (String, Retry)> {
         if self.config.channel_id.is_empty() {
             return Ok(());
         }
-        let url = format!(
-            "https://discord.com/api/v10/channels/{}/messages",
-            self.config.channel_id
-        );
         let response = self
             .http
-            .post(url)
-            .bearer_auth(&self.config.bot_token)
+            .post(send_url(&self.config.channel_id))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                auth_header(&self.config.bot_token),
+            )
             .json(&json!({ "content": text }))
             .send()
             .await
@@ -959,6 +972,16 @@ mod tests {
         }
         assert_eq!(poster.attempts.get(), 5);
         assert!(start.elapsed() >= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rest_uses_the_bot_authorization_scheme() {
+        assert_eq!(auth_header("tok"), "Bot tok");
+        assert_eq!(auth_header("  tok \n"), "Bot tok");
+        assert_eq!(
+            send_url("123"),
+            "https://discord.com/api/v10/channels/123/messages"
+        );
     }
 
     #[test]

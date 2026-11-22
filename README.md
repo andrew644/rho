@@ -167,6 +167,11 @@ possible, otherwise they re-identify, and reconnect waits back off from 1 s to
 60 s. Authentication and intent failures (`4004`, `4013`, `4014`) stop the
 bridge instead of retrying; progress and failures print to stderr.
 
+Replies are posted with `Authorization: Bot <token>`, so `discord.bot_token`
+must hold the bot token from the developer portal (not an OAuth2 access
+token); a `401` means the token is missing or wrong, a `403` means the bot
+lacks permission in that channel.
+
 ## Tests
 
 ```sh
