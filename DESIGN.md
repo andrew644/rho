@@ -182,12 +182,24 @@ loop:
 ### Discord remote control
 
 - Plain websocket + JSON against the Discord **gateway** (v10, intents
-  `GUILDS|GUILD_MESSAGES|DIRECT_MESSAGES` via `IDENTIFY`, heartbeat loop,
-  `HELLO`/`RESUME` handled) — no heavy crate dependency.
+  `GUILDS|GUILD_MESSAGES|DIRECT_MESSAGES` via `IDENTIFY`) — no heavy crate
+  dependency. `HELLO` sets the heartbeat period, the first beat is jittered,
+  an unacknowledged beat (`op 11` missing) drops the connection, `op 1`
+  requests an immediate beat, and `op 9` invalidates the session.
+- Reconnects send `RESUME` (`op 6`) with the `session_id`/`seq` and the
+  `resume_gateway_url` handed out by `READY`; close codes decide the next
+  move: `4004/4010/4011/4013/4014` stop the bridge, `4007/4008/4009/4012`
+  re-identify, anything else resumes. Wait between attempts doubles from 1 s
+  to 60 s with jitter and resets once a session identifies.
 - Incoming `MESSAGE_CREATE` from the configured channel (or DM) from the
   allowed user: text is enqueued as an agent prompt; agent replies
-  (final assistant text, truncated to 2000 chars, split if longer) are POSTed
-  to `/channels/{id}/messages`.
+  (final assistant text, split at 2000 chars) go to a bounded outbox drained
+  by a worker that POSTs `/channels/{id}/messages` at 4 messages per 5 s, so
+  chunk bursts stay under Discord's per-channel limit.
+- A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,
+  5xx waits a second; up to 3 attempts per chunk. Other 4xx (bad token,
+  missing permissions) are not retried. When the outbox is full the newest
+  chunks are dropped rather than blocking the agent.
 - Shares the same serial prompt queue as the TUI, so the two never issue
   concurrent model requests.
 

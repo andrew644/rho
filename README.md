@@ -152,6 +152,21 @@ With `discord.enabled`, rho connects to the Discord gateway as a bot and
 pipes messages from the configured channel (or DMs) into the same serial
 prompt queue as the TUI; final answers are posted back, split at 2000 chars.
 
+`channel_id` is where replies go, so leave it empty and rho reads messages but
+never answers. The simplest working setup is a DM with the bot: message the
+bot once, right-click the DM channel to copy its ID, and put that ID in
+`channel_id`. Discord strips message text for server channels unless the bot
+has the privileged *Message Content Intent*, which rho does not request, so DM
+the bot rather than adding it to a server.
+
+Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
+retried after the `Retry-After` Discord reports (up to 3 attempts); a full
+outbox drops the newest chunks instead of blocking the agent. Dropped
+gateway connections resume with `op 6` using the saved `session_id`/`seq` when
+possible, otherwise they re-identify, and reconnect waits back off from 1 s to
+60 s. Authentication and intent failures (`4004`, `4013`, `4014`) stop the
+bridge instead of retrying; progress and failures print to stderr.
+
 ## Tests
 
 ```sh
