@@ -617,7 +617,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let sub = d.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
-        let abs = Agent::resolve_pwd(std::path::Path::new("/"), &d.path().to_path_buf()).unwrap();
+        let abs = Agent::resolve_pwd(std::path::Path::new("/"), d.path()).unwrap();
         assert!(abs.is_dir());
         let rel = Agent::resolve_pwd(&abs, std::path::Path::new("sub")).unwrap();
         assert_eq!(rel, sub.canonicalize().unwrap());
