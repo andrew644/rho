@@ -140,20 +140,63 @@ fn kind_style(kind: Kind) -> Style {
     }
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let chars: Vec<char> = line.chars().collect();
-        for chunk in chars.chunks(width) {
-            out.push(chunk.iter().collect());
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let cur = lines.last().unwrap().chars().count();
+        let sep = usize::from(cur > 0);
+        if cur + sep + word.chars().count() <= width {
+            if sep > 0 {
+                lines.last_mut().unwrap().push(' ');
+            }
+            lines.last_mut().unwrap().push_str(word);
+        } else {
+            lines.push(String::new());
+            let chars: Vec<char> = word.chars().collect();
+            let mut start = 0;
+            while start + width < chars.len() {
+                lines.last_mut().unwrap().extend(&chars[start..start + width]);
+                lines.push(String::new());
+                start += width;
+            }
+            lines.last_mut().unwrap().extend(&chars[start..]);
         }
     }
-    out
+    if lines.len() > 1 && lines[0].is_empty() {
+        lines.remove(0);
+    } else if lines.len() == 1 && lines[0].is_empty() {
+        lines.clear();
+    }
+    lines
+}
+
+fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
+    let style = kind_style(entry.kind);
+    let prefix = kind_prefix(entry.kind);
+    let indent = prefix.chars().count();
+    let avail = width.saturating_sub(indent).max(1);
+    let mut lines = Vec::new();
+    let src_lines: Vec<&str> = if entry.text.is_empty() {
+        vec![""]
+    } else {
+        entry.text.lines().collect()
+    };
+    for (i, src) in src_lines.iter().enumerate() {
+        let mut wrapped = wrap_words(src, avail);
+        if wrapped.is_empty() {
+            wrapped.push(String::new());
+        }
+        for (j, w) in wrapped.iter().enumerate() {
+            let text = if i == 0 && j == 0 {
+                format!("{prefix}{w}")
+            } else {
+                format!("{}{w}", " ".repeat(indent))
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+    lines
 }
 
 pub struct App {
@@ -164,6 +207,7 @@ pub struct App {
     history: Vec<String>,
     history_index: Option<usize>,
     scroll_from_bottom: usize,
+    show_reasoning: bool,
     status: String,
     loop_status: Option<String>,
     busy: bool,
@@ -200,6 +244,7 @@ impl App {
             history: Vec::new(),
             history_index: None,
             scroll_from_bottom: 0,
+            show_reasoning: true,
             status: "idle".to_string(),
             loop_status: None,
             busy: false,
@@ -263,9 +308,6 @@ impl App {
             AgentEvent::ReasoningDelta(t) => {
                 self.busy = true;
                 self.append_pending(&t, Kind::Reasoning);
-                if self.pending.as_ref().map(|p| p.text.ends_with('\n')) == Some(true) {
-                    self.flush_pending();
-                }
             }
             AgentEvent::TextDelta(t) => {
                 self.busy = true;
@@ -359,6 +401,18 @@ impl App {
             KeyCode::Esc => {
                 cancel.store(true, Ordering::SeqCst);
                 self.push("interrupt requested", Kind::Info);
+                false
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_reasoning = !self.show_reasoning;
+                self.push(
+                    if self.show_reasoning {
+                        "reasoning shown"
+                    } else {
+                        "reasoning hidden"
+                    },
+                    Kind::Info,
+                );
                 false
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
@@ -653,19 +707,22 @@ impl App {
         let scrollbar_area = text_chunks[1];
         let width = text_area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
-        let append_entry = |entry: &Entry, lines: &mut Vec<Line>| {
-            for line in wrap_text(&entry.text, width.saturating_sub(2)) {
-                lines.push(Line::from(Span::styled(
-                    format!("{}{line}", kind_prefix(entry.kind)),
-                    kind_style(entry.kind),
-                )));
+        let mut prev_kind: Option<Kind> = None;
+        let mut append = |entry: &Entry, lines: &mut Vec<Line>| {
+            if !self.show_reasoning && entry.kind == Kind::Reasoning {
+                return;
             }
+            if prev_kind.is_some_and(|k| k != entry.kind) {
+                lines.push(Line::from(""));
+            }
+            prev_kind = Some(entry.kind);
+            lines.extend(entry_lines(entry, width));
         };
         for entry in &self.entries {
-            append_entry(entry, &mut lines);
+            append(entry, &mut lines);
         }
         if let Some(pending) = &self.pending {
-            append_entry(pending, &mut lines);
+            append(pending, &mut lines);
         }
         let new_lines = lines.len().saturating_sub(self.last_rendered_lines);
         if !self.follow && new_lines > 0 {
@@ -991,14 +1048,48 @@ mod tests {
 
 #[cfg(test)]
 mod wrap_tests {
-    use super::wrap_text;
+    use super::{entry_lines, wrap_words, Entry, Kind};
+    use std::path::PathBuf;
 
     #[test]
-    fn wraps_long_lines() {
-        let w = wrap_text("abcdefgh", 3);
-        assert_eq!(w, vec!["abc", "def", "gh"]);
-        assert_eq!(wrap_text("a\nb", 10), vec!["a", "b"]);
-        assert_eq!(wrap_text("", 10), Vec::<String>::new());
+    fn wraps_on_word_boundaries() {
+        assert_eq!(wrap_words("acknowledge this", 12), vec!["acknowledge", "this"]);
+        assert_eq!(wrap_words("one two three", 20), vec!["one two three"]);
+        assert_eq!(wrap_words("a b", 10), vec!["a b"]);
+        assert_eq!(wrap_words("", 10), Vec::<String>::new());
+    }
+
+    #[test]
+    fn hard_splits_words_longer_than_width() {
+        assert_eq!(wrap_words("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        assert_eq!(
+            wrap_words("supercalifragilistic expi", 10),
+            vec!["supercalif", "ragilistic", "expi"]
+        );
+    }
+
+    #[test]
+    fn entry_lines_use_prefix_and_hanging_indent() {
+        let entry = Entry {
+            text: "acknowledge this now".to_string(),
+            kind: Kind::User,
+        };
+        let lines = entry_lines(&entry, 13);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["❯ acknowledge", "  this now"]);
+    }
+
+    #[test]
+    fn reasoning_entry_renders_as_one_block() {
+        let mut app = super::App::new(PathBuf::from("/tmp"), "m".into(), vec![], vec![]);
+        app.on_event(super::AgentEvent::ReasoningDelta("line one\n".into()));
+        app.on_event(super::AgentEvent::ReasoningDelta("line two".into()));
+        let pending = app.pending.as_ref().unwrap();
+        assert_eq!(pending.text, "line one\nline two");
+        assert_eq!(entry_lines(pending, 40).len(), 2);
     }
 }
 
@@ -1221,5 +1312,39 @@ mod scroll_tests {
             );
         }
         assert!(screen.iter().any(|l| l.starts_with('x')));
+    }
+
+    #[test]
+    fn different_kinds_are_separated_by_blank_line() {
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        app.push("hello there".to_string(), Kind::User);
+        app.push("a response".to_string(), Kind::Assistant);
+        let screen = render(&mut app, 80, 24);
+        let user_row = screen.iter().position(|l| l.contains("hello there")).unwrap();
+        let resp_row = screen.iter().position(|l| l.contains("a response")).unwrap();
+        assert_eq!(resp_row, user_row + 2, "blank line between turns: {screen:#?}");
+        assert_eq!(screen[user_row + 1].trim(), "");
+    }
+
+    #[test]
+    fn ctrl_r_toggles_reasoning_visibility() {
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        app.push("because reasons".to_string(), Kind::Reasoning);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let key = |code| {
+            crossterm::event::KeyEvent::new(code, KeyModifiers::CONTROL)
+        };
+        assert!(render(&mut app, 80, 24)
+            .iter()
+            .any(|l| l.contains("because reasons")));
+        app.handle_key(key(KeyCode::Char('r')), &tx, &cancel);
+        assert!(!render(&mut app, 80, 24)
+            .iter()
+            .any(|l| l.contains("because reasons")));
+        app.handle_key(key(KeyCode::Char('r')), &tx, &cancel);
+        assert!(render(&mut app, 80, 24)
+            .iter()
+            .any(|l| l.contains("because reasons")));
     }
 }

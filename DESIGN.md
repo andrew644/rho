@@ -167,10 +167,10 @@ Improvements identified from a hands-on review of the running TUI.
 
 ### Transcript readability
 
-1. [ ] **Word wrap + reasoning block** — wrapped lines re-prefix `∴ ` and break
+1. [x] **Word wrap + reasoning block** — wrapped lines re-prefix `∴ ` and break
    mid-word ("acknow / ledge"). Wrap on word boundaries with a hanging indent;
    render reasoning as one dim block; add a Ctrl+R toggle to hide/collapse it.
-2. [ ] **Turn separation** — insert a blank line (or thin separator) between
+2. [x] **Turn separation** — insert a blank line (or thin separator) between
    turns so user input, reasoning, tool output, and answers don't run together.
 3. [ ] **Markdown / code rendering** — assistant output shows raw backticks and
    fences; detect code fences (indent + dim background, no reflow) at minimum,
