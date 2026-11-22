@@ -254,6 +254,23 @@ fn assistant_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+const INPUT_INDENT: usize = 2;
+
+#[derive(Debug)]
+struct InputRow {
+    line: usize,
+    sub: usize,
+    start: usize,
+    text: String,
+}
+
+#[derive(Debug)]
+struct InputLayout {
+    lines: Vec<Line<'static>>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
 const BUILTIN_COMMANDS: [&str; 12] = [
     "compact", "exit", "help", "loop", "model", "name", "new", "pwd", "quit", "resume", "session",
     "stop",
@@ -287,35 +304,70 @@ fn fmt_tokens(n: usize) -> String {
     format!("{num}{unit}")
 }
 
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = vec![String::new()];
-    for word in text.split_whitespace() {
-        let cur = lines.last().unwrap().chars().count();
-        let sep = usize::from(cur > 0);
-        if cur + sep + word.chars().count() <= width {
-            if sep > 0 {
-                lines.last_mut().unwrap().push(' ');
+fn words_with_offsets(text: &str) -> Vec<(usize, &str)> {
+    let mut words = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                words.push((s, &text[s..i]));
             }
-            lines.last_mut().unwrap().push_str(word);
         } else {
-            lines.push(String::new());
-            let chars: Vec<char> = word.chars().collect();
-            let mut start = 0;
-            while start + width < chars.len() {
-                lines
-                    .last_mut()
-                    .unwrap()
-                    .extend(&chars[start..start + width]);
-                lines.push(String::new());
-                start += width;
-            }
-            lines.last_mut().unwrap().extend(&chars[start..]);
+            start.get_or_insert(i);
         }
     }
-    if lines.len() > 1 && lines[0].is_empty() {
-        lines.remove(0);
-    } else if lines.len() == 1 && lines[0].is_empty() {
+    if let Some(s) = start {
+        words.push((s, &text[s..]));
+    }
+    words
+}
+
+fn wrap_segments(text: &str, width: usize) -> Vec<(usize, String)> {
+    let width = width.max(1);
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    let lead_bytes = text.len() - text.trim_start().len();
+    let lead = text[..lead_bytes].chars().count().min(width);
+    if lead > 0 {
+        rows.push((0, " ".repeat(lead)));
+    }
+    for (byte, word) in words_with_offsets(text) {
+        let col = text[..byte].chars().count();
+        let cur = rows.last().map(|(_, s)| s.chars().count()).unwrap_or(0);
+        let sep = usize::from(cur > lead);
+        let chars: Vec<char> = word.chars().collect();
+        if cur + sep + chars.len() <= width {
+            if cur > 0 {
+                let row = &mut rows.last_mut().unwrap().1;
+                if sep > 0 {
+                    row.push(' ');
+                }
+                row.extend(chars.iter());
+            } else {
+                rows.push((col, word.to_string()));
+            }
+            continue;
+        }
+        if chars.len() <= width {
+            rows.push((col, word.to_string()));
+            continue;
+        }
+        let mut start = 0;
+        while start + width < chars.len() {
+            rows.push((col + start, chars[start..start + width].iter().collect()));
+            start += width;
+        }
+        rows.push((col + start, chars[start..].iter().collect()));
+    }
+    rows
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let trimmed = text.trim_start();
+    let mut lines = wrap_segments(trimmed, width)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>();
+    if lines.len() == 1 && lines[0].is_empty() {
         lines.clear();
     }
     lines
@@ -857,23 +909,64 @@ impl App {
         self.cursor += text.chars().count();
     }
 
-    fn input_layout(&self, width: usize, rows: usize) -> (Vec<Line<'static>>, usize, usize) {
+    fn wrapped_input(&self, width: usize) -> Vec<InputRow> {
+        let avail = width.saturating_sub(INPUT_INDENT).max(1);
+        let mut flat: Vec<InputRow> = Vec::new();
+        for (line, text) in self.input.split('\n').enumerate() {
+            let mut wrapped = wrap_segments(text, avail);
+            if wrapped.is_empty() {
+                wrapped.push((0, String::new()));
+            }
+            flat.extend(
+                wrapped
+                    .into_iter()
+                    .enumerate()
+                    .map(|(sub, (start, text))| InputRow {
+                        line,
+                        sub,
+                        start,
+                        text,
+                    }),
+            );
+        }
+        flat
+    }
+
+    fn input_height(&self, width: usize) -> u16 {
+        (self.wrapped_input(width).len() as u16 + 2).clamp(3, 8)
+    }
+
+    fn input_layout(&self, width: usize, rows: usize) -> InputLayout {
         let rows = rows.max(1);
         let before: String = self.input.chars().take(self.cursor).collect();
         let cur_line = before.matches('\n').count();
         let cur_col = before.chars().rev().take_while(|c| *c != '\n').count();
-        let lines: Vec<&str> = self.input.split('\n').collect();
-        let top = cur_line.saturating_sub(rows - 1);
-        let bottom = (top + rows).min(lines.len());
-        let hscroll = cur_col.saturating_sub(width.saturating_sub(4));
-        let view = (top..bottom)
+
+        let flat = self.wrapped_input(width);
+        let cursor_row = flat
+            .iter()
+            .rposition(|row| row.line == cur_line && row.start <= cur_col)
+            .or_else(|| flat.iter().rposition(|row| row.line < cur_line))
+            .unwrap_or(0);
+        let top = cursor_row.saturating_sub(rows - 1);
+        let bottom = (top + rows).min(flat.len());
+        let lines = (top..bottom)
             .map(|i| {
-                let prompt = if i == 0 { "❯ " } else { "  " };
-                let text: String = lines[i].chars().skip(hscroll).collect();
-                Line::from(Span::raw(format!("{prompt}{text}")))
+                let row = &flat[i];
+                let prompt = if row.line == 0 && row.sub == 0 {
+                    "❯ "
+                } else {
+                    "  "
+                };
+                Line::from(Span::raw(format!("{prompt}{}", row.text)))
             })
             .collect();
-        (view, cur_line - top, cur_col.saturating_sub(hscroll))
+        let cursor = &flat[cursor_row];
+        InputLayout {
+            lines,
+            cursor_row: cursor_row - top,
+            cursor_col: (cur_col - cursor.start).min(cursor.text.chars().count()),
+        }
     }
 
     pub fn scroll_by(&mut self, lines: i32) {
@@ -1134,7 +1227,10 @@ impl App {
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.update_status();
-        let input_height = if self.input.contains('\n') { 5 } else { 3 };
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let input_height = self
+            .input_height(inner_width)
+            .min(area.height.saturating_sub(4).max(3));
         let chunks = if self.loop_status.is_some() {
             let split = Layout::vertical([
                 Constraint::Min(3),
@@ -1223,11 +1319,13 @@ impl App {
             .border_style(border_style);
         let inner = input_block.inner(chunks.2);
         frame.render_widget(input_block, chunks.2);
-        let prompt_lines = self.input_layout(inner.width as usize, inner.height as usize);
-        frame.render_widget(Paragraph::new(prompt_lines.0), inner);
+        let prompt = self.input_layout(inner.width as usize, inner.height as usize);
+        frame.render_widget(Paragraph::new(prompt.lines), inner);
         frame.set_cursor_position((
-            inner.x.saturating_add(2 + prompt_lines.2 as u16),
-            inner.y.saturating_add(prompt_lines.1 as u16),
+            inner
+                .x
+                .saturating_add(INPUT_INDENT as u16 + prompt.cursor_col as u16),
+            inner.y.saturating_add(prompt.cursor_row as u16),
         ));
     }
 
@@ -1731,17 +1829,102 @@ mod tests {
         let mut app = test_app();
         app.insert_text("l1\nl2\nl3\nl4");
         app.cursor = app.input.len();
-        let (view, row, col) = app.input_layout(40, 2);
-        let texts: Vec<String> = view
+        let layout = app.input_layout(40, 2);
+        let texts: Vec<String> = layout
+            .lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(texts, vec!["  l3", "  l4"]);
-        assert_eq!((row, col), (1, 2));
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 2));
         app.cursor = 3;
-        let (view, row, _) = app.input_layout(40, 2);
-        assert_eq!(row, 1);
-        assert_eq!(view[0].spans[0].content, "❯ l1");
+        let layout = app.input_layout(40, 2);
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.lines[0].spans[0].content, "❯ l1");
+    }
+
+    fn layout_texts(layout: &super::InputLayout) -> Vec<String> {
+        layout
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn input_layout_wraps_on_last_whitespace_before_width() {
+        let mut app = test_app();
+        app.insert_text("the quick brown fox jumps");
+        app.cursor = app.input.len();
+        let layout = app.input_layout(20, 5);
+        assert_eq!(
+            layout_texts(&layout),
+            vec!["❯ the quick brown", "  fox jumps"]
+        );
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 9));
+    }
+
+    #[test]
+    fn input_layout_cursor_sits_on_the_row_it_wraps_to() {
+        let mut app = test_app();
+        app.insert_text("one two three");
+        app.cursor = "one t".len();
+        let layout = app.input_layout(9, 5);
+        assert_eq!(layout_texts(&layout), vec!["❯ one two", "  three"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (0, 5));
+        app.cursor = "one two ".len();
+        let layout = app.input_layout(9, 5);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn input_layout_hard_splits_tokens_longer_than_the_width() {
+        let mut app = test_app();
+        app.insert_text("abcdefghij");
+        app.cursor = app.input.len();
+        let layout = app.input_layout(8, 5);
+        assert_eq!(layout_texts(&layout), vec!["❯ abcdef", "  ghij"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 4));
+    }
+
+    #[test]
+    fn input_layout_scrolls_to_keep_a_wrapped_cursor_row_visible() {
+        let mut app = test_app();
+        app.insert_text("aaaa bbbb cccc dddd");
+        app.cursor = app.input.len();
+        let layout = app.input_layout(10, 2);
+        assert_eq!(layout_texts(&layout), vec!["  cccc", "  dddd"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 4));
+    }
+
+    #[test]
+    fn input_layout_clamps_the_cursor_to_the_end_of_its_row() {
+        let mut app = test_app();
+        app.insert_text("one two   ");
+        app.cursor = app.input.len();
+        let layout = app.input_layout(9, 5);
+        assert_eq!(layout_texts(&layout), vec!["❯ one two"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (0, 7));
+    }
+
+    #[test]
+    fn wrapped_input_keeps_the_prompt_on_the_first_row_only() {
+        let mut app = test_app();
+        app.insert_text("wrap me please\nnext");
+        let layout = app.input_layout(10, 6);
+        assert_eq!(
+            layout_texts(&layout),
+            vec!["❯ wrap me", "  please", "  next"]
+        );
+    }
+
+    #[test]
+    fn cursor_at_the_start_of_a_line_lands_on_that_line_not_the_previous_wrap() {
+        let mut app = test_app();
+        app.insert_text("wrap me please\nnext");
+        app.cursor = "wrap me please\n".len();
+        let layout = app.input_layout(10, 6);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (2, 0));
     }
 }
 
@@ -2290,6 +2473,27 @@ mod scroll_tests {
             "blank line between turns: {screen:#?}"
         );
         assert_eq!(screen[user_row + 1].trim(), "");
+    }
+
+    #[test]
+    fn typed_input_wraps_instead_of_scrolling_horizontally() {
+        let mut app = test_app();
+        app.insert_text("the quick brown fox jumps over the lazy dog");
+        let screen = render(&mut app, 40, 12);
+        let box_rows: Vec<&String> = screen
+            .iter()
+            .filter(|l| {
+                l.starts_with('│') && (l.contains('❯') || l.contains("brown") || l.contains("lazy"))
+            })
+            .collect();
+        assert_eq!(
+            box_rows,
+            vec![
+                &"│❯ the quick brown fox jumps over the  │".to_string(),
+                &"│  lazy dog                            │".to_string()
+            ]
+        );
+        assert!(!screen.iter().any(|l| l.contains("dog") && l.contains('❯')));
     }
 
     #[test]

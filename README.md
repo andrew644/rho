@@ -52,7 +52,8 @@ cargo run
   and template names; after `/pwd ` they also complete directory paths
   (bash-style: unique matches complete and descend, ambiguous matches cycle;
   `~` expands to home; dotfiles appear once you type `.`). Shift+Enter or Ctrl+J insert newlines in the input
-  (pasted multiline text is never submitted early); Enter submits.
+  (pasted multiline text is never submitted early); Enter submits. Long input wraps on the last whitespace
+  before the edge of the box (the box grows up to 8 rows) instead of scrolling sideways.
 - Tools: `read`, `bash`, `edit`, `write` (same semantics as pi).
 - `!cmd` runs a shell command and shares its output with the model;
   `!!cmd` runs it without sharing. `/pwd <path>` changes the working
