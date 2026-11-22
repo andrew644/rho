@@ -26,11 +26,7 @@ async fn live_simple_chat() {
         )
         .await
         .unwrap();
-    assert!(
-        reply.content.contains("PONG"),
-        "got: {:?}",
-        reply.content
-    );
+    assert!(reply.content.contains("PONG"), "got: {:?}", reply.content);
 }
 
 #[tokio::test]

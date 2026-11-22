@@ -1,9 +1,14 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -358,13 +363,11 @@ impl App {
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::PageUp => {
-                self.follow = false;
-                self.scroll_from_bottom += 10;
+                self.scroll_by(10);
                 false
             }
             KeyCode::PageDown => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(10);
-                self.follow = self.scroll_from_bottom == 0;
+                self.scroll_by(-10);
                 false
             }
             KeyCode::End => {
@@ -439,6 +442,16 @@ impl App {
                 false
             }
             _ => false,
+        }
+    }
+
+    pub fn scroll_by(&mut self, lines: i32) {
+        if lines > 0 {
+            self.follow = false;
+            self.scroll_from_bottom += lines as usize;
+        } else if lines < 0 {
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub((-lines) as usize);
+            self.follow = self.scroll_from_bottom == 0;
         }
     }
 
@@ -583,7 +596,10 @@ impl App {
                     let _ = agent.send(AgentCommand::SetModel { id: arg });
                 } else {
                     self.push(
-                        format!("unknown model: {arg} (available: {})", self.known_models.join(", ")),
+                        format!(
+                            "unknown model: {arg} (available: {})",
+                            self.known_models.join(", ")
+                        ),
                         Kind::Error,
                     );
                 }
@@ -631,7 +647,11 @@ impl App {
             (None, split[0], split[1])
         };
 
-        let width = chunks.1.width as usize;
+        let text_chunks =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).split(chunks.1);
+        let text_area = text_chunks[0];
+        let scrollbar_area = text_chunks[1];
+        let width = text_area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
         let append_entry = |entry: &Entry, lines: &mut Vec<Line>| {
             for line in wrap_text(&entry.text, width.saturating_sub(2)) {
@@ -652,12 +672,24 @@ impl App {
             self.scroll_from_bottom += new_lines;
         }
         self.last_rendered_lines = lines.len();
-        let visible = chunks.1.height as usize;
+        let visible = text_area.height as usize;
         let scroll = lines
             .len()
             .saturating_sub(visible + self.scroll_from_bottom);
         let paragraph = Paragraph::new(lines).scroll((scroll as u16, 0));
-        frame.render_widget(paragraph, chunks.1);
+        frame.render_widget(paragraph, text_area);
+        if visible > 0 && self.last_rendered_lines > visible {
+            let mut scrollbar_state = ScrollbarState::new(self.last_rendered_lines)
+                .position(scroll)
+                .viewport_content_length(visible);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                scrollbar_area,
+                &mut scrollbar_state,
+            );
+        }
 
         if let Some(bar) = chunks.0 {
             let status = self.loop_status.clone().unwrap_or_default();
@@ -695,7 +727,9 @@ pub async fn run(
     opts: TuiOptions,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = run_inner(&mut terminal, agent, cancel, &mut events, opts).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -729,10 +763,18 @@ async fn run_inner(
                 }
             }
             maybe_key = keys.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_key {
-                    if app.handle_key(key, &agent, &cancel) {
-                        break;
+                match maybe_key {
+                    Some(Ok(Event::Key(key))) => {
+                        if app.handle_key(key, &agent, &cancel) {
+                            break;
+                        }
                     }
+                    Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_by(3),
+                        MouseEventKind::ScrollDown => app.scroll_by(-3),
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
             _ = ticker.tick() => {
@@ -1041,16 +1083,9 @@ mod scroll_tests {
             .collect()
     }
 
-
-
     #[test]
     fn pages_vertically_not_horizontally() {
-        let mut app = App::new(
-            PathBuf::from("/tmp"),
-            "m".into(),
-            vec!["m".into()],
-            vec![],
-        );
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
         for i in 0..60 {
             app.push(format!("line {i}"), Kind::Tool);
         }
@@ -1068,7 +1103,10 @@ mod scroll_tests {
             &cancel,
         );
         let screen = render(&mut app, 80, 24);
-        assert!(screen.iter().any(|l| l.contains("line 45")), "after PgUp: {screen:#?}");
+        assert!(
+            screen.iter().any(|l| l.contains("line 45")),
+            "after PgUp: {screen:#?}"
+        );
         assert!(
             !screen.iter().any(|l| l.contains("line 59")),
             "tail should scroll off after PgUp"
@@ -1079,9 +1117,11 @@ mod scroll_tests {
             &cancel,
         );
         let screen = render(&mut app, 80, 24);
-        assert!(screen.iter().any(|l| l.contains("line 59")), "after PageDown");
+        assert!(
+            screen.iter().any(|l| l.contains("line 59")),
+            "after PageDown"
+        );
     }
-
 
     #[test]
     fn scrolled_view_survives_streaming_output() {
@@ -1110,8 +1150,63 @@ mod scroll_tests {
             &cancel,
         );
         let screen = render(&mut app, 80, 24);
-        assert!(screen.iter().any(|l| l.contains("more streaming text")), "{screen:#?}");
+        assert!(
+            screen.iter().any(|l| l.contains("more streaming text")),
+            "{screen:#?}"
+        );
         assert!(screen.iter().any(|l| l.contains("bash")));
+    }
+
+    #[test]
+    fn wheel_scroll_detaches_and_reattaches_follow() {
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        assert!(app.follow);
+        app.scroll_by(3);
+        assert!(!app.follow);
+        assert_eq!(app.scroll_from_bottom, 3);
+        app.scroll_by(-3);
+        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.follow);
+        app.scroll_by(-5);
+        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.follow);
+    }
+
+    fn right_column(screen: &[String]) -> String {
+        screen
+            .iter()
+            .skip(1)
+            .take(19)
+            .map(|line| line.chars().nth(79).unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn scrollbar_appears_on_overflow_and_follows_scroll() {
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        for i in 0..60 {
+            app.push(format!("line {i}"), Kind::Tool);
+        }
+        let screen = render(&mut app, 80, 24);
+        let col = right_column(&screen);
+        assert!(col.contains('█'), "expected scrollbar thumb, got: {col:?}");
+
+        app.scroll_by(30);
+        let screen = render(&mut app, 80, 24);
+        let scrolled_col = right_column(&screen);
+        assert_ne!(col, scrolled_col, "thumb should move when scrolled");
+    }
+
+    #[test]
+    fn no_scrollbar_when_content_fits() {
+        let mut app = App::new(PathBuf::from("/tmp"), "m".into(), vec!["m".into()], vec![]);
+        app.push("short message".to_string(), Kind::User);
+        let screen = render(&mut app, 80, 24);
+        let col = right_column(&screen);
+        assert!(
+            col.chars().all(|c| c == ' '),
+            "no scrollbar expected, got: {col:?}"
+        );
     }
 
     #[test]
@@ -1120,7 +1215,10 @@ mod scroll_tests {
         app.push("x".repeat(500), Kind::Assistant);
         let screen = render(&mut app, 80, 24);
         for row in &screen {
-            assert!(row.trim_end().chars().count() <= 80, "row too wide: {row:?}");
+            assert!(
+                row.trim_end().chars().count() <= 80,
+                "row too wide: {row:?}"
+            );
         }
         assert!(screen.iter().any(|l| l.starts_with('x')));
     }

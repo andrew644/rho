@@ -66,7 +66,10 @@ pub fn spawn(
     });
 }
 
-async fn gateway_session(config: &Config, agent_tx: &mpsc::UnboundedSender<AgentCommand>) -> anyhow::Result<()> {
+async fn gateway_session(
+    config: &Config,
+    agent_tx: &mpsc::UnboundedSender<AgentCommand>,
+) -> anyhow::Result<()> {
     let (mut ws, _) = connect_async(GATEWAY_URL).await?;
     let hello: Value = read_json(&mut ws).await?;
     let interval_ms = hello["d"]["heartbeat_interval"]
@@ -145,7 +148,10 @@ async fn read_json<T: serde::de::DeserializeOwned>(
     anyhow::bail!("gateway stream ended")
 }
 
-async fn reply_relay(config: crate::config::DiscordConfig, mut events: broadcast::Receiver<AgentEvent>) {
+async fn reply_relay(
+    config: crate::config::DiscordConfig,
+    mut events: broadcast::Receiver<AgentEvent>,
+) {
     let http = reqwest::Client::new();
     loop {
         match events.recv().await {
@@ -163,7 +169,11 @@ async fn reply_relay(config: crate::config::DiscordConfig, mut events: broadcast
     }
 }
 
-async fn post_message(http: &reqwest::Client, config: &crate::config::DiscordConfig, text: &str) -> anyhow::Result<()> {
+async fn post_message(
+    http: &reqwest::Client,
+    config: &crate::config::DiscordConfig,
+    text: &str,
+) -> anyhow::Result<()> {
     if config.channel_id.is_empty() {
         return Ok(());
     }
@@ -178,7 +188,11 @@ async fn post_message(http: &reqwest::Client, config: &crate::config::DiscordCon
         .send()
         .await?;
     if !resp.status().is_success() {
-        anyhow::bail!("discord REST {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+        anyhow::bail!(
+            "discord REST {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -213,6 +227,9 @@ mod tests {
         let text = "é".repeat(1500);
         let chunks = chunk_message(&text);
         assert_eq!(chunks.concat(), text);
-        assert_eq!(chunks.iter().map(|c| c.chars().count()).sum::<usize>(), 1500);
+        assert_eq!(
+            chunks.iter().map(|c| c.chars().count()).sum::<usize>(),
+            1500
+        );
     }
 }
