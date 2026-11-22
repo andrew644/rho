@@ -78,6 +78,12 @@ history as system + summary + kept tail. `/compact [instructions]` runs the
 same flow manually; `!cmd` / `!!cmd` run shell commands with or without
 feeding the output to the model.
 
+Like pi, a response truncated at `max_tokens` triggers a single compact-and-
+retry recovery: the truncated attempt is dropped, context is compacted, and
+the request is retried once. Partial (mid-tool-call) truncations are never
+replayed to the model. If the retry truncates again the turn ends with
+"truncated response recovery failed after one compact-and-retry attempt".
+
 ### Prompt templates
 
 `~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` load as slash

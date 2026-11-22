@@ -64,6 +64,9 @@ directory, grouped by working directory. Long conversations are compacted
 automatically when the context estimate nears `context_window`, or manually
 with `/compact`.
 
+If a response is cut off at `max_tokens`, rho compacts and retries the
+request once (like pi) instead of just reporting the truncation.
+
 ### Prompt templates
 
 Markdown files in `~/.config/rho/prompts/*.md` or `<cwd>/.rho/prompts/*.md`

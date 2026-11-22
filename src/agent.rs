@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -78,6 +77,7 @@ pub struct Agent {
     model: String,
     session_path: Option<PathBuf>,
     session_header: Option<SessionHeader>,
+    truncation_recovery_used: bool,
 }
 
 impl Agent {
@@ -120,6 +120,7 @@ impl Agent {
             history,
             cancel: cancel.clone(),
             cwd,
+            truncation_recovery_used: false,
             session_path,
             session_header,
         };
@@ -362,6 +363,7 @@ impl Agent {
 
     async fn drive(&mut self, events: &broadcast::Sender<AgentEvent>) -> anyhow::Result<()> {
         let specs = self.tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
+        self.truncation_recovery_used = false;
         for _ in 0..self.config.loop_config.max_turns_per_run {
             if self.cancelled() {
                 return Ok(());
@@ -404,9 +406,31 @@ impl Agent {
             forwarder.abort();
 
             if assistant.finish_reason.as_deref() == Some("length") {
+                if !self.truncation_recovery_used {
+                    self.truncation_recovery_used = true;
+                    let _ = events.send(AgentEvent::Info(
+                        "response truncated at max_tokens; compacting and retrying".to_string(),
+                    ));
+                    self.compact_now(None, events, false).await;
+                    continue;
+                }
                 let _ = events.send(AgentEvent::Error(
-                    "response truncated at max_tokens".to_string(),
+                    "truncated response recovery failed after one compact-and-retry attempt"
+                        .to_string(),
                 ));
+                let text = assistant.content.clone();
+                self.history.push(Message {
+                    role: "assistant".to_string(),
+                    content: if text.is_empty() {
+                        None
+                    } else {
+                        Some(text.clone())
+                    },
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                let _ = events.send(AgentEvent::AssistantDone { text });
+                return Ok(());
             }
 
             let mut message = Message {
@@ -473,7 +497,8 @@ impl Agent {
         let tool = self
             .tool(name)
             .ok_or_else(|| format!("unknown tool: {name}"))?;
-        let args: serde_json::Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+        let args: serde_json::Value = serde_json::from_str(raw_args)
+            .map_err(|e| format!("invalid tool arguments (possibly truncated): {e}"))?;
         tokio::task::spawn_blocking(move || tool.execute(&args))
             .await
             .map_err(|e| format!("tool task failed: {e}"))
