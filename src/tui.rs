@@ -75,7 +75,7 @@ pub fn classify_input(input: &str, template_names: &[String]) -> Option<InputAct
         }
         return Some(InputAction::Command(Command::Unknown("!".to_string())));
     }
-    if let Some(rest) = input.strip_prefix('/') {
+    if let Some(rest) = input.strip_prefix(':') {
         let (name, args) = match rest.split_once(char::is_whitespace) {
             Some((n, a)) => (n, a.trim()),
             None => (rest, ""),
@@ -541,7 +541,7 @@ impl App {
         session_path: Option<String>,
     ) -> Self {
         let welcome = format!(
-            "rho v{} · model {model} · context {} tokens\npwd {}\nsession {}\n/help for commands · Esc interrupts · Ctrl+R toggles reasoning · Ctrl+O expands tool output · drag to select and copy",
+            "rho v{} · model {model} · context {} tokens\npwd {}\nsession {}\n:help for commands · Esc interrupts · Ctrl+R toggles reasoning · Ctrl+O expands tool output · drag to select and copy",
             env!("CARGO_PKG_VERSION"),
             fmt_tokens(context_window as usize),
             pwd.display(),
@@ -623,10 +623,10 @@ impl App {
             }
         }
         let nchars = self.input.chars().count();
-        if !self.input.starts_with('/') || self.cursor != nchars {
+        if !self.input.starts_with(':') || self.cursor != nchars {
             return;
         }
-        if let Some(rest) = self.input.strip_prefix("/pwd ").map(|s| s.to_string()) {
+        if let Some(rest) = self.input.strip_prefix(":pwd ").map(|s| s.to_string()) {
             let token = rest.trim_start().to_string();
             if !token.contains(char::is_whitespace) {
                 self.complete_path(&token);
@@ -647,10 +647,10 @@ impl App {
             return;
         }
         if matches.len() == 1 {
-            self.input = format!("/{} ", matches[0]);
+            self.input = format!(":{} ", matches[0]);
             self.completion = None;
         } else {
-            let cands: Vec<String> = matches.iter().map(|n| format!("/{n}")).collect();
+            let cands: Vec<String> = matches.iter().map(|n| format!(":{n}")).collect();
             self.input = cands[0].clone();
             self.completion = Some((cands, 0));
         }
@@ -682,7 +682,7 @@ impl App {
             return;
         }
         names.sort();
-        let cands: Vec<String> = names.iter().map(|n| format!("/pwd {parent}{n}/")).collect();
+        let cands: Vec<String> = names.iter().map(|n| format!(":pwd {parent}{n}/")).collect();
         self.input = cands[0].clone();
         self.completion = if cands.len() == 1 {
             None
@@ -1317,7 +1317,7 @@ impl App {
 
     fn show_help(&mut self) {
         self.push(
-            "commands: /loop [forever|N|10m|until \"cond\"] <task>, /compact [instructions], /new, /resume [n], /session, /discord, /name <text>, /model [id], /pwd [path], /stop, /help, /quit",
+            "commands: :loop [forever|N|10m|until \"cond\"] <task>, :compact [instructions], :new, :resume [n], :session, :discord, :name <text>, :model [id], :pwd [path], :stop, :help, :quit",
             Kind::Info,
         );
         self.push("!cmd runs a shell command and shares its output with the model; !!cmd runs it without sharing", Kind::Info);
@@ -1337,7 +1337,7 @@ impl App {
             self.push("no saved sessions for this directory", Kind::Info);
             return;
         }
-        self.push("recent sessions (use /resume <n> to open):", Kind::Info);
+        self.push("recent sessions (use :resume <n> to open):", Kind::Info);
         let list = self.session_list.clone();
         for (i, s) in list.iter().enumerate() {
             let name = s.header.name.as_deref().unwrap_or("(unnamed)");
@@ -1366,7 +1366,7 @@ impl App {
             }
             Some(InputAction::Command(Command::Loop(args))) => match parse_loop_spec(&args) {
                 Ok(spec) => {
-                    self.history.push(format!("/loop {args}"));
+                    self.history.push(format!(":loop {args}"));
                     self.busy = true;
                     self.status = "looping".to_string();
                     self.send_to_agent(agent, AgentCommand::Loop { spec });
@@ -1376,8 +1376,8 @@ impl App {
             Some(InputAction::Command(Command::Help)) => self.show_help(),
             Some(InputAction::Command(Command::Compact(instructions))) => {
                 self.history.push(match &instructions {
-                    Some(i) => format!("/compact {i}"),
-                    None => "/compact".to_string(),
+                    Some(i) => format!(":compact {i}"),
+                    None => ":compact".to_string(),
                 });
                 self.busy = true;
                 self.status = "compacting".to_string();
@@ -1394,7 +1394,7 @@ impl App {
                 if path.is_empty() {
                     self.push(format!("pwd: {}", self.pwd.display()), Kind::Info);
                 } else {
-                    self.history.push(format!("/pwd {path}"));
+                    self.history.push(format!(":pwd {path}"));
                     self.send_to_agent(agent, AgentCommand::SetPwd { path: PathBuf::from(path) });
                 }
             }
@@ -1410,7 +1410,7 @@ impl App {
                             self.clear_selection();
                             self.push(format!("resumed session {}", n), Kind::Info);
                         }
-                        _ => self.push("usage: /resume to list, /resume <n> to open", Kind::Error),
+                        _ => self.push("usage: :resume to list, :resume <n> to open", Kind::Error),
                     }
                 }
             }
@@ -1466,15 +1466,15 @@ impl App {
             }
             Some(InputAction::Command(Command::Template { name, args })) => {
                 let Some(template) = self.templates.iter().find(|t| t.name == name).cloned() else {
-                    self.push(format!("unknown template: /{name}"), Kind::Error);
+                    self.push(format!("unknown template: :{name}"), Kind::Error);
                     return false;
                 };
                 let parsed = templates::tokenize_args(&args);
                 let expanded = templates::expand_template(&template.body, &parsed);
                 let display = if args.is_empty() {
-                    format!("/{name}")
+                    format!(":{name}")
                 } else {
-                    format!("/{name} {args}")
+                    format!(":{name} {args}")
                 };
                 self.submit_prompt(&display, expanded, agent);
             }
@@ -1485,7 +1485,7 @@ impl App {
                 self.send_to_agent(agent, AgentCommand::Shell { command, to_model });
             }
             Some(InputAction::Command(Command::Unknown(name))) => {
-                self.push(format!("unknown command: /{name}"), Kind::Error);
+                self.push(format!("unknown command: :{name}"), Kind::Error);
             }
             None => {}
         }
@@ -1718,20 +1718,24 @@ mod tests {
         );
         assert_eq!(classify_input("  ", &tpl), None);
         assert_eq!(
-            classify_input("/quit", &tpl),
+            classify_input(":quit", &tpl),
             Some(InputAction::Command(Command::Quit))
         );
         assert_eq!(
-            classify_input("/exit", &tpl),
+            classify_input(":exit", &tpl),
             Some(InputAction::Command(Command::Quit))
         );
         assert_eq!(
-            classify_input("/loop 5 build", &tpl),
+            classify_input(":loop 5 build", &tpl),
             Some(InputAction::Command(Command::Loop("5 build".into())))
         );
         assert_eq!(
-            classify_input("/wat", &tpl),
+            classify_input(":wat", &tpl),
             Some(InputAction::Command(Command::Unknown("wat".into())))
+        );
+        assert_eq!(
+            classify_input("/quit", &tpl),
+            Some(InputAction::Submit("/quit".into()))
         );
     }
 
@@ -1739,28 +1743,28 @@ mod tests {
     fn classify_templates_and_builtins() {
         let tpl = vec!["review".to_string()];
         assert_eq!(
-            classify_input("/review concurrency", &tpl),
+            classify_input(":review concurrency", &tpl),
             Some(InputAction::Command(Command::Template {
                 name: "review".into(),
                 args: "concurrency".into()
             }))
         );
         assert_eq!(
-            classify_input("/quit", &tpl),
+            classify_input(":quit", &tpl),
             Some(InputAction::Command(Command::Quit))
         );
         assert_eq!(
-            classify_input("/compact focus on tests", &tpl),
+            classify_input(":compact focus on tests", &tpl),
             Some(InputAction::Command(Command::Compact(Some(
                 "focus on tests".into()
             ))))
         );
         assert_eq!(
-            classify_input("/compact", &tpl),
+            classify_input(":compact", &tpl),
             Some(InputAction::Command(Command::Compact(None)))
         );
         assert_eq!(
-            classify_input("/resume 2", &tpl),
+            classify_input(":resume 2", &tpl),
             Some(InputAction::Command(Command::Resume("2".into())))
         );
     }
@@ -1805,12 +1809,12 @@ mod tests {
             Theme::new(ThemeName::Dark),
             None,
         );
-        app.on_submit("/greet world", &tx);
+        app.on_submit(":greet world", &tx);
         match rx.try_recv().unwrap() {
             AgentCommand::Prompt { text } => assert_eq!(text, "hello world"),
             other => panic!("unexpected command: {other:?}"),
         }
-        assert!(app.entries.iter().any(|e| e.text == "/greet world"));
+        assert!(app.entries.iter().any(|e| e.text == ":greet world"));
     }
 
     #[test]
@@ -1924,7 +1928,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut app = test_app();
         let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
-        for c in "/quit".chars() {
+        for c in ":quit".chars() {
             app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
         }
         assert!(app.handle_key(key(KeyCode::Enter), &tx, &cancel));
@@ -2012,20 +2016,20 @@ mod tests {
         let mut app = test_app();
         app.pwd = d.path().to_path_buf();
         let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
-        for c in "/pwd s".chars() {
+        for c in ":pwd s".chars() {
             app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
         }
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
-        assert_eq!(app.input, "/pwd scripts/");
+        assert_eq!(app.input, ":pwd scripts/");
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
-        assert_eq!(app.input, "/pwd src/");
+        assert_eq!(app.input, ":pwd src/");
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
-        assert_eq!(app.input, "/pwd scripts/");
+        assert_eq!(app.input, ":pwd scripts/");
         app.completion = None;
-        app.input = "/pwd src/".to_string();
+        app.input = ":pwd src/".to_string();
         app.cursor = 9;
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
-        assert_eq!(app.input, "/pwd src/main/");
+        assert_eq!(app.input, ":pwd src/main/");
         assert_eq!(app.cursor, app.input.chars().count());
     }
 
@@ -2033,7 +2037,7 @@ mod tests {
     fn pwd_submission_sends_completed_path() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = test_app();
-        app.on_submit("/pwd src/main/", &tx);
+        app.on_submit(":pwd src/main/", &tx);
         match rx.try_recv().unwrap() {
             AgentCommand::SetPwd { path } => assert_eq!(path, PathBuf::from("src/main/")),
             other => panic!("unexpected command: {other:?}"),
@@ -2046,11 +2050,11 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut app = test_app();
         let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
-        for c in "/res".chars() {
+        for c in ":res".chars() {
             app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
         }
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
-        assert_eq!(app.input, "/resume ");
+        assert_eq!(app.input, ":resume ");
         assert_eq!(app.cursor, 8);
     }
 
@@ -2060,10 +2064,10 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut app = test_app();
         let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
-        app.handle_key(key(KeyCode::Char('/')), &tx, &cancel);
+        app.handle_key(key(KeyCode::Char(':')), &tx, &cancel);
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
         let first = app.input.clone();
-        assert!(first.starts_with('/') && !first.contains(' '), "{first}");
+        assert!(first.starts_with(':') && !first.contains(' '), "{first}");
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
         assert_ne!(app.input, first);
         app.handle_key(key(KeyCode::BackTab), &tx, &cancel);
@@ -2082,11 +2086,11 @@ mod tests {
             body: "hello".into(),
         });
         let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
-        for c in "/gr".chars() {
+        for c in ":gr".chars() {
             app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
         }
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
-        assert_eq!(app.input, "/greet ");
+        assert_eq!(app.input, ":greet ");
     }
 
     #[test]
@@ -2095,7 +2099,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut app = test_app();
         let key = |code| crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
-        app.handle_key(key(KeyCode::Char('/')), &tx, &cancel);
+        app.handle_key(key(KeyCode::Char(':')), &tx, &cancel);
         app.handle_key(key(KeyCode::Tab), &tx, &cancel);
         let first = app.input.clone();
         app.handle_key(key(KeyCode::Char('c')), &tx, &cancel);
@@ -2361,11 +2365,11 @@ mod draw_tests {
     fn classify_pwd_command() {
         let tpl: Vec<String> = vec![];
         assert_eq!(
-            classify_input("/pwd /tmp/other", &tpl),
+            classify_input(":pwd /tmp/other", &tpl),
             Some(InputAction::Command(Command::Pwd("/tmp/other".into())))
         );
         assert_eq!(
-            classify_input("/pwd", &tpl),
+            classify_input(":pwd", &tpl),
             Some(InputAction::Command(Command::Pwd(String::new())))
         );
     }
@@ -2374,13 +2378,13 @@ mod draw_tests {
     fn pwd_command_sends_setpwd_or_shows_current() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = test_app();
-        app.on_submit("/pwd", &tx);
+        app.on_submit(":pwd", &tx);
         assert!(app
             .entries
             .iter()
             .any(|e| e.kind == Kind::Info && e.text.contains("pwd:")));
         assert!(rx.try_recv().is_err());
-        app.on_submit("/pwd ../elsewhere", &tx);
+        app.on_submit(":pwd ../elsewhere", &tx);
         match rx.try_recv().unwrap() {
             AgentCommand::SetPwd { path } => assert_eq!(path, PathBuf::from("../elsewhere")),
             other => panic!("unexpected command: {other:?}"),
@@ -2391,12 +2395,12 @@ mod draw_tests {
     fn discord_command_reports_the_bridge_or_says_it_is_off() {
         let tpl: Vec<String> = vec![];
         assert_eq!(
-            classify_input("/discord", &tpl),
+            classify_input(":discord", &tpl),
             Some(InputAction::Command(Command::Discord))
         );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = test_app();
-        app.on_submit("/discord", &tx);
+        app.on_submit(":discord", &tx);
         assert!(app
             .entries
             .iter()
@@ -2410,7 +2414,7 @@ mod draw_tests {
             allowed_user_id: "42".to_string(),
         };
         app.discord = Some(Arc::new(Bridge::new(&config, events, false)));
-        app.on_submit("/discord", &tx);
+        app.on_submit(":discord", &tx);
         let text: String = app
             .entries
             .iter()
@@ -2478,7 +2482,7 @@ mod draw_tests {
 
         let mut app = test_app();
         app.discord = Some(bridge);
-        app.on_submit("/discord", &tx);
+        app.on_submit(":discord", &tx);
 
         let errors: Vec<&str> = app
             .entries
@@ -2555,7 +2559,7 @@ mod draw_tests {
             .join("\n");
         assert!(content.contains("❯ hello world"), "{content}");
         assert!(!app.handle_key(key(KeyCode::Enter), &tx, &cancel));
-        for c in "/quit".chars() {
+        for c in ":quit".chars() {
             app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
         }
         assert!(app.handle_key(key(KeyCode::Enter), &tx, &cancel));

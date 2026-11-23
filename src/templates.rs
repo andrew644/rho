@@ -235,7 +235,7 @@ pub fn render_help(templates: &[Template]) -> String {
     let mut out = String::new();
     for t in templates {
         let hint = t.argument_hint.as_deref().unwrap_or("");
-        out.push_str(&format!("/{} {hint} — {}\n", t.name, t.description));
+        out.push_str(&format!(":{} {hint} — {}\n", t.name, t.description));
     }
     out
 }
@@ -286,6 +286,28 @@ fn truncate_head(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_help_uses_the_colon_prefix() {
+        let templates = vec![
+            Template {
+                name: "review".into(),
+                description: "Review the diff".into(),
+                argument_hint: Some("[focus]".into()),
+                body: String::new(),
+            },
+            Template {
+                name: "greet".into(),
+                description: "Greet someone".into(),
+                argument_hint: None,
+                body: String::new(),
+            },
+        ];
+        assert_eq!(
+            render_help(&templates),
+            ":review [focus] — Review the diff\n:greet  — Greet someone\n"
+        );
+    }
 
     #[test]
     fn parses_frontmatter() {

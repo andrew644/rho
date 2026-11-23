@@ -19,6 +19,9 @@ under rho's design constraints is. This document splits pi's features into:
 3. **Out of scope by design** (excluded by rho's design constraints)
 4. **Rho-only additions** (not present in pi)
 
+pi's commands are typed with a `/` prefix and rho's with a `:` prefix, so the
+Pi columns below keep pi's spelling (`/compact` is rho's `:compact`).
+
 ## 1. Parity — implemented before step 13
 
 | Pi feature | Rho equivalent | Notes |
@@ -28,7 +31,7 @@ under rho's design constraints is. This document splits pi's features into:
 | SSE streaming, `reasoning_content`, tool-call accumulation | `client` module | Finish reasons `stop`/`tool_calls`/`length` handled |
 | Sectioned system prompt + `AGENTS.md` project context | `prompt` module | preamble/tools/rules/project_context/cwd |
 | Interactive TUI (transcript, streaming, input, slash commands) | `tui` module | ratatui; Esc interrupt, PgUp/PgDn scroll, prompt history |
-| `/help`, `/quit`, `/stop` | TUI commands | |
+| `/help`, `/quit`, `/stop` | TUI commands | rho spells these `:help`, `:quit`, `:stop` |
 | Follow-up messages while busy | Agent command queue | Enter queues; processed after the current task |
 | Single local provider via openai-completions | `config` + `client` | Design constraint (pi: many providers via `/login`) |
 
@@ -37,13 +40,13 @@ under rho's design constraints is. This document splits pi's features into:
 | Pi feature | Rho implementation |
 |---|---|
 | Session persistence (auto-save JSONL per working directory) | `session` module; sessions stored under the state dir keyed by cwd; header + message records |
-| `pi --continue` / `/new` / `/resume` / `/session` / `/name` | CLI `--continue`; TUI `/new`, `/resume [n]`, `/session`, `/name <text>` |
-| Compaction: `/compact [instructions]` + auto-compaction near the context limit | `compaction` module; token estimate ≈ chars/4; reserve/keep-recent thresholds configurable; summary replaces old prefix, recent messages kept; conversation serialized for summarization with 2000-char tool results; cut points at user and assistant messages |
+| `pi --continue` / `/new` / `/resume` / `/session` / `/name` | CLI `--continue`; TUI `:new`, `:resume [n]`, `:session`, `:name <text>` |
+| Compaction: `/compact [instructions]` + auto-compaction near the context limit | `compaction` module; rho's command is `:compact`; token estimate ≈ chars/4; reserve/keep-recent thresholds configurable; summary replaces old prefix, recent messages kept; conversation serialized for summarization with 2000-char tool results; cut points at user and assistant messages |
 | Overflow / truncated-length recovery: one compact-and-retry attempt, session stays usable | `agent` + `client`: `ApiError::is_context_overflow` pattern matching, history sanitizer, synthetic results for truncated tool calls |
-| Prompt templates (markdown files → `/name` commands with `$1`, `$@`, `${1:-def}` substitutions) | `templates` module; loaded from `~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` |
+| Prompt templates (markdown files → `/name` commands with `$1`, `$@`, `${1:-def}` substitutions) | `templates` module; rho invokes them as `:name`; loaded from `~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` |
 | `!` / `!!` shell escapes (run a command, optionally feed output to the model) | TUI `!<cmd>` runs and appends output to conversation; `!!<cmd>` runs without sending to the model |
 | Print mode (`pi --print "…"`, piped stdin, `@file` inclusion, initial prompts) | `rho --print [--continue] [--model id] [@file…] <prompt…>`; final answer to stdout, exit non-zero on error |
-| `/model` model selection | `model.models` list in config; `/model` lists, `/model <id>` switches; CLI `--model` override |
+| `/model` model selection | `model.models` list in config; `:model` lists, `:model <id>` switches; CLI `--model` override |
 | Multi-line editor (Shift+Enter), tool-output expand (Ctrl+O), thinking toggle (Ctrl+R in rho) | Shift+Enter/Ctrl+J insert newlines (bracketed paste inserts verbatim); Ctrl+O expands capped tool output; Ctrl+R shows/hides reasoning |
 | Slash-command and template autocomplete | Tab / Shift-Tab cycle matching commands and template names |
 | Footer showing model, context usage | Status bar shows session/pwd, model id, spinner + elapsed time, context usage as percent with yellow/red thresholds, session name |
@@ -73,7 +76,7 @@ are **not** parity gaps for rho's purposes:
 
 | Feature | Notes |
 |---|---|
-| `/loop` (forever / N times / duration / until-condition) | Not shipped by pi ("Pi… skips features like sub-agents and plan mode") |
+| `:loop` (forever / N times / duration / until-condition) | Not shipped by pi ("Pi… skips features like sub-agents and plan mode") |
 | Discord remote-control bridge | Gateway websocket + REST relay sharing the serial prompt queue |
 | In-transcript selection with clipboard copy | rho captures the mouse (wheel scroll), so it draws its own selection: drag / double-click word / triple-click row, Ctrl+Y to copy again, OSC 52 with `wl-copy`/`xclip`/`xsel`/`pbcopy` fallback, `clipboard:` config |
 

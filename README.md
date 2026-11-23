@@ -15,7 +15,7 @@ provider:
 model:
   id: qwen4exp
   max_tokens: 4096
-  # models: [other-model]     # extra ids selectable with /model
+  # models: [other-model]     # extra ids selectable with :model
 # theme: light              # dark | light | ansi
 # clipboard: auto           # auto | terminal | system (how copies reach the clipboard)
 # compaction:
@@ -48,7 +48,7 @@ cargo run
   border dims and Enter queues the text.
 - Esc interrupts the current generation/loop. The mouse wheel, PgUp/PgDn, and
   Home/End scroll the transcript (a scrollbar shows the viewport). Up/Down walk
-  prompt history. Ctrl+C or `/quit` exits.
+  prompt history. Ctrl+C or `:quit` exits.
 - Drag with the mouse to select transcript text; releasing copies it and the
   footer says where it went (`copied 132 characters to terminal`). Double-click
   selects a word, triple-click selects the row, Ctrl+Y re-copies the current
@@ -57,15 +57,15 @@ cargo run
   included). Scrolling or streaming keeps the highlight on the same text.
   Paste with the terminal's usual paste (bracketed paste is enabled, so
   multi-line pastes land in the input without submitting).
-- Ctrl+R toggles the reasoning block. Tab / Shift-Tab complete slash commands
-  and template names; after `/pwd ` they also complete directory paths
+- Ctrl+R toggles the reasoning block. Tab / Shift-Tab complete colon commands
+  and template names; after `:pwd ` they also complete directory paths
   (bash-style: unique matches complete and descend, ambiguous matches cycle;
   `~` expands to home; dotfiles appear once you type `.`). Shift+Enter or Ctrl+J insert newlines in the input
   (pasted multiline text is never submitted early); Enter submits. Long input wraps on the last whitespace
   before the edge of the box (the box grows up to 8 rows) instead of scrolling sideways.
 - Tools: `read`, `bash`, `edit`, `write` (same semantics as pi).
 - `!cmd` runs a shell command and shares its output with the model;
-  `!!cmd` runs it without sharing. `/pwd <path>` changes the working
+  `!!cmd` runs it without sharing. `:pwd <path>` changes the working
   directory for tools, agent requests, and `!`/`!!` commands.
 - Anything that is broken but survivable — a session file that cannot be
   created, so the conversation stops being saved — is drawn as an error line in
@@ -87,23 +87,25 @@ handling).
 
 ### Commands
 
+Commands are typed in the input with a `:` prefix.
+
 ```
-/loop [forever|N|10m|until "cond"] <task>   agentic loop (rho-only feature)
-/compact [instructions]                     summarize old history to free context
-/new                                        start a new session
-/resume [n]                                 list recent sessions / open one
-/session                                    session file, id, message/token counts
-/discord                                    bridge status: connection, intents, servers, counters, errors
-/name <text>                                name the current session
-/model [id]                                 list models / switch
-/pwd [path]                                 show / change the working directory
-/stop  /help  /quit
+:loop [forever|N|10m|until "cond"] <task>   agentic loop (rho-only feature)
+:compact [instructions]                     summarize old history to free context
+:new                                        start a new session
+:resume [n]                                 list recent sessions / open one
+:session                                    session file, id, message/token counts
+:discord                                    bridge status: connection, intents, servers, counters, errors
+:name <text>                                name the current session
+:model [id]                                 list models / switch
+:pwd [path]                                 show / change the working directory
+:stop  :help  :quit
 ```
 
 Conversations are saved automatically as JSONL sessions under the state
 directory, grouped by working directory. Long conversations are compacted
 automatically when the context estimate nears `context_window`, or manually
-with `/compact`.
+with `:compact`.
 
 If a response is cut off at `max_tokens`, rho compacts and retries the
 request once (like pi). A context-overflow error from the server gets the
@@ -113,7 +115,8 @@ leaves the session history valid, so you can keep prompting.
 ### Prompt templates
 
 Markdown files in `~/.config/rho/prompts/*.md` or `<cwd>/.rho/prompts/*.md`
-become slash commands (filename = command name). Supported substitutions:
+become commands invoked as `:name` (filename = command name). Supported
+substitutions:
 `$1..$n`, `$@`/`$ARGUMENTS`, `${1:-default}`, `${@:-default}`, `${@:N}`,
 `${@:N:L}`; optional `description:` and `argument-hint:` frontmatter.
 
@@ -140,13 +143,13 @@ a specific one, `--model <id>` overrides the configured model. Piped stdin
 is prepended to the prompt and `@file` arguments are expanded into it. When
 stdout/stdin are redirected, print mode is the default.
 
-### /loop
+### :loop
 
 ```
-/loop forever <task>
-/loop 5 <task>
-/loop 30m <task>
-/loop until "<yes/no condition>" <task>
+:loop forever <task>
+:loop 5 <task>
+:loop 30m <task>
+:loop until "<yes/no condition>" <task>
 ```
 
 Each iteration re-sends the task prompt to the agent. `until` asks the model
@@ -233,7 +236,7 @@ History*), a typing ping Discord
 refused, and a message that never reached the agent. So a bridge that is
 connected but not delivering is loud, not silent.
 
-`/discord` prints the same picture on demand: connection state, the intents
+`:discord` prints the same picture on demand: connection state, the intents
 Discord granted, the servers the bot can see, how many messages arrived, how
 many were queued as prompts, how many reply chunks went out, the last inbound
 line, how many reactions and typing indicators went out and how many Discord
@@ -256,7 +259,7 @@ Replies are posted with `Authorization: Bot <token>`, so `discord.bot_token`
 must hold the bot token from the developer portal (not an OAuth2 access
 token); a `401` means the token is missing or wrong, a `403` means the bot
 lacks permission in that channel. Both arrive in the transcript as an error
-line naming the channel that refused the reply, and `/discord` keeps the last
+line naming the channel that refused the reply, and `:discord` keeps the last
 one.
 
 ## Tests

@@ -60,7 +60,7 @@ pub fn parse_loop_spec(input: &str) -> Result<LoopSpec, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err(
-            "usage: /loop [forever | <n> | <duration e.g. 10m> | until \"<condition>\"] <task>"
+            "usage: :loop [forever | <n> | <duration e.g. 10m> | until \"<condition>\"] <task>"
                 .to_string(),
         );
     }
@@ -72,10 +72,10 @@ pub fn parse_loop_spec(input: &str) -> Result<LoopSpec, String> {
     if mode_token == "until" {
         let rest = rest
             .strip_prefix('"')
-            .ok_or_else(|| "usage: /loop until \"<condition>\" <task>".to_string())?;
+            .ok_or_else(|| "usage: :loop until \"<condition>\" <task>".to_string())?;
         let end = rest
             .find('"')
-            .ok_or_else(|| "unterminated condition string in /loop until".to_string())?;
+            .ok_or_else(|| "unterminated condition string in :loop until".to_string())?;
         let condition = rest[..end].trim().to_string();
         let prompt = rest[end + 1..].trim().to_string();
         if condition.is_empty() {

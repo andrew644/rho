@@ -15,14 +15,14 @@ rho
 ├── tools       read, bash, edit, write (same schemas/semantics as pi)
 ├── prompt      system prompt builder (preamble/tools/rules/docs/pwd sections + AGENTS.md project context)
 ├── agent       the agentic loop: user msg → stream → tool calls → results → repeat
-├── loops       /loop command: forever | N times | duration | until-condition prompt
-├── session     JSONL session persistence per working directory (/new /resume /session /name, --continue)
-├── compaction  token estimation + cut-point logic for /compact and auto-compaction
-├── templates   prompt templates: markdown files → slash commands with $1/$@ substitutions
+├── loops       :loop command: forever | N times | duration | until-condition prompt
+├── session     JSONL session persistence per working directory (:new :resume :session :name, --continue)
+├── compaction  token estimation + cut-point logic for :compact and auto-compaction
+├── templates   prompt templates: markdown files → colon commands with $1/$@ substitutions
 ├── discord     remote control via Discord (gateway websocket + REST send)
 └── tui         ratatui chat UI: wrapped transcript (reasoning blocks, code fences,
                 capped tool output), spinner/percent footer, multiline input,
-                slash-command autocomplete, theming
+                colon-command autocomplete, theming
 ```
 
 ### Data flow
@@ -71,13 +71,13 @@ inside rho…"), `<tools>`, `<rules>`, `<project_context>` (contents of
 
 Every conversation is saved automatically as JSONL (`header` record +
 `message` records) under the OS state directory, grouped by working
-directory. `/new`, `/resume [n]`, `/session`, `/name`, and `rho --continue`
+directory. `:new`, `:resume [n]`, `:session`, `:name`, and `rho --continue`
 manage sessions; resumed sessions rebuild the history under a freshly built
 system prompt for the current working directory.
 
-### /pwd
+### :pwd
 
-`/pwd [path]` prints or changes the working directory. Relative paths resolve
+`:pwd [path]` prints or changes the working directory. Relative paths resolve
 against the current pwd. While typing the argument, Tab/Shift-Tab complete
 directory names (unique matches complete and continue into the directory,
 ambiguous matches cycle; `~` expands to home). Changing it rebuilds the tools (so `read`/`bash`/
@@ -93,7 +93,7 @@ the next model request: it walks back from the end to find a user- or
 assistant-message cut point that keeps `keep_recent_tokens` of recent
 history (tool results are never split from their tool call), asks the model
 for a structured summary of everything before the cut, and rebuilds the
-history as system + summary + kept tail. `/compact [instructions]` runs the
+history as system + summary + kept tail. `:compact [instructions]` runs the
 same flow manually; `!cmd` / `!!cmd` run shell commands with or without
 feeding the output to the model.
 
@@ -119,7 +119,7 @@ pi's overflow patterns) takes the same single compact-and-retry path.
 
 ### Prompt templates
 
-`~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` load as slash
+`~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` load as `:`-prefixed
 commands (filename = name). Arguments follow pi's shell-style quoting and
 substitute via `$1..$n`, `$@`/`$ARGUMENTS`, `${1:-default}`, `${@:-default}`,
 `${@:N}`, `${@:N:L}`.
@@ -157,7 +157,7 @@ provider:
 model:
   id: qwen4exp
   max_tokens: 4096
-  models: []            # extra ids selectable with /model
+  models: []            # extra ids selectable with :model
 context_window: 200000
 theme: dark             # dark | light | ansi
 clipboard: auto         # auto | terminal | system
@@ -174,12 +174,12 @@ loop:
   max_turns_per_run: 64
 ```
 
-### /loop
+### :loop
 
-`/loop [forever | <n> | <duration e.g. 10m, 90s> | until: <prompt>] <task prompt>`
+`:loop [forever | <n> | <duration e.g. 10m, 90s> | until: <prompt>] <task prompt>`
 
 - forever / n times / duration: repeatedly send the task prompt to the agent;
-  stop on user interrupt (Esc / `/stop`).
+  stop on user interrupt (Esc / `:stop`).
 - `until: <condition prompt>`: after each run, ask the model a yes/no
   condition (non-streaming, `tool_choice: none`) and stop when it answers YES.
 - The loop runs as a background task producing `LoopProgress` events; a
@@ -248,7 +248,7 @@ loop:
   granted intents, servers, message, reply, reaction and typing counters, last
   inbound line, error count and last error) behind an `Arc<Mutex<_>>`, and the
   TUI renders it
-  for `/discord` one `StatusLine` at a time, each marked with whether it is
+  for `:discord` one `StatusLine` at a time, each marked with whether it is
   reporting a fault so the broken parts come up as errors.
 - A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,
   5xx waits a second; up to 3 attempts per chunk. Other 4xx (bad token,
@@ -268,11 +268,11 @@ loop:
 6. [x] `prompt` module: system prompt + AGENTS.md context + tests
 7. [x] `agent` module: serial event loop, tool execution, events + tests
 8. [x] `loop` module: loop specs/parsing/condition check + tests
-9. [x] `tui` module: ratatui app, slash commands incl. /loop, integrate agent
+9. [x] `tui` module: ratatui app, colon commands incl. :loop, integrate agent
 10. [x] `discord` module: gateway client + bridge + tests for pure parts
 11. [x] End-to-end smoke test against the local server
 12. [x] Compare features in Pi and Rho and document what still needs to be implemented (see PARITY.md)
-13. [x] Continue implementing features from Pi until parity is met (sessions, compaction, prompt templates, shell escapes, print mode, /model — see PARITY.md §2)
+13. [x] Continue implementing features from Pi until parity is met (sessions, compaction, prompt templates, shell escapes, print mode, :model — see PARITY.md §2)
 
 ## UI TODO
 
@@ -298,14 +298,14 @@ Improvements identified from a hands-on review of the running TUI.
    animated frames (`⠋⠙⠹⠸…`) and show elapsed seconds for the current turn.
 6. [x] **Context usage as percent** — show `~478/128k (0.4%)` instead of a bare
    token count; shift color yellow→red as auto-compaction approaches.
-7. [x] **Footer identity info** — include session name (after `/name`,
+7. [x] **Footer identity info** — include session name (after `:name`,
    `--continue`) and cwd basename so side-by-side agents are distinguishable.
 
 ### Input UX
 
 8. [x] **Busy-state input affordance** — dim the input border or show
    "queued" while the agent is running so it's clear what Enter will do.
-9. [x] **Slash-command autocomplete** — typing `/` + Tab (or arrows) filters
+9. [x] **Colon-command autocomplete** — typing `:` + Tab (or arrows) filters
    and completes built-in commands and template names.
 10. [x] **Multiline input** — Shift+Enter / Ctrl+J insert a newline instead of
     submitting, so pasted multi-line prompts don't fire early.

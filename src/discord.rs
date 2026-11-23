@@ -229,7 +229,7 @@ impl Server {
     }
 }
 
-/// One line of the `/discord` report. `fault` says the line is reporting
+/// One line of the `:discord` report. `fault` says the line is reporting
 /// something broken, so the transcript draws it as an error instead of as
 /// routine news.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,7 +249,7 @@ impl StatusLine {
 }
 
 /// What the bridge knows about the live connection. The TUI shows it through
-/// `/discord` because stderr is invisible while the transcript owns the screen.
+/// `:discord` because stderr is invisible while the transcript owns the screen.
 #[derive(Debug, Default)]
 pub struct Status {
     pub state: String,
@@ -432,7 +432,7 @@ impl Bridge {
     }
 
     /// Reports a failure the bridge hit: it lands in the transcript as an error
-    /// line and is remembered for `/discord`, so a bridge that cannot deliver is
+    /// line and is remembered for `:discord`, so a bridge that cannot deliver is
     /// never silent.
     pub fn fail(&self, message: &str) {
         {
@@ -571,7 +571,7 @@ impl Bridge {
         status.summary(&self.allowed_user_id, &self.fallback_channel)
     }
 
-    /// The `/discord` report, one line at a time and marked with whether it
+    /// The `:discord` report, one line at a time and marked with whether it
     /// reports a fault, so the TUI can draw the broken parts as errors.
     pub fn report(&self) -> Vec<StatusLine> {
         let status = self.lock();
@@ -1224,7 +1224,7 @@ impl<P: Poster> SignalTask<P> {
     }
 }
 
-/// Start the bridge and hand back the status the TUI reads for `/discord`.
+/// Start the bridge and hand back the status the TUI reads for `:discord`.
 /// `console` is true when no TUI is drawing on the terminal (print/headless
 /// runs), which is the only case where notes go to stderr.
 pub fn spawn(
