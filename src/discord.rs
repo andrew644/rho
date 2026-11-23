@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -36,6 +36,17 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+const EYES: &str = "\u{1f440}";
+const SIGNAL_DEPTH: usize = 32;
+const SIGNALS_PER_WINDOW: usize = 4;
+const SIGNAL_WINDOW: Duration = Duration::from_secs(5);
+const TYPING_TICK: Duration = Duration::from_secs(8);
+/// The deadline to beat is shorter than the tick that checks it, so a ping that
+/// lands a moment after a tick is still due on the next one instead of drifting
+/// past Discord's own 10 s expiry.
+const TYPING_REFRESH: Duration = Duration::from_secs(6);
+const TYPING_CAP: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ignore {
@@ -176,6 +187,16 @@ pub fn arrival(d: &Value, inbound: &Inbound, server: Option<&str>) -> String {
 
 const QUOTED_MAX: usize = 60;
 
+/// Says how many of a courtesy Discord refused, so the count in the report is
+/// not read as the number the user actually saw.
+fn refusal_note(errors: usize) -> String {
+    match errors {
+        0 => String::new(),
+        1 => " (1 refused)".to_string(),
+        errors => format!(" ({errors} refused)"),
+    }
+}
+
 fn quoted(text: &str) -> String {
     let flat: String = text
         .chars()
@@ -240,6 +261,10 @@ pub struct Status {
     pub bot_messages_seen: usize,
     pub prompts_queued: usize,
     pub replies_posted: usize,
+    pub reactions: usize,
+    pub reaction_errors: usize,
+    pub typing: usize,
+    pub typing_errors: usize,
     pub last_inbound: Option<String>,
     pub errors: usize,
     pub last_error: Option<String>,
@@ -334,6 +359,16 @@ impl Status {
                 format!(
                     "discord: last message in: {}",
                     self.last_inbound.as_deref().unwrap_or("none")
+                ),
+                false,
+            ),
+            line(
+                format!(
+                    "discord: {} reaction(s) added{}, {} typing indicator(s) sent{}",
+                    self.reactions,
+                    refusal_note(self.reaction_errors),
+                    self.typing,
+                    refusal_note(self.typing_errors)
                 ),
                 false,
             ),
@@ -486,6 +521,44 @@ impl Bridge {
 
     pub fn note_reply_posted(&self, chunks: usize) {
         self.lock().replies_posted += chunks;
+    }
+
+    pub fn note_reaction(&self) {
+        self.lock().reactions += 1;
+    }
+
+    /// The first refusal names the permission it wanted, because reactions are
+    /// cosmetic and the user needs to know prompts are unaffected; the rest are
+    /// only counted, so a busy channel cannot repeat the same complaint.
+    pub fn note_reaction_failure(&self, target: &str, message: &str) {
+        let first = {
+            let mut status = self.lock();
+            status.reaction_errors += 1;
+            status.reaction_errors == 1
+        };
+        if first {
+            self.fail(&format!(
+                "discord: could not add a reaction to {target}: {message}; reactions need the \
+                 Add Reactions permission, prompts and replies work without them"
+            ));
+        }
+    }
+
+    pub fn note_typing(&self) {
+        self.lock().typing += 1;
+    }
+
+    pub fn note_typing_failure(&self, target: &str, message: &str) {
+        let first = {
+            let mut status = self.lock();
+            status.typing_errors += 1;
+            status.typing_errors == 1
+        };
+        if first {
+            self.fail(&format!(
+                "discord: could not show typing in {target}: {message}"
+            ));
+        }
     }
 
     pub fn note_send_failure(&self, message: &str) {
@@ -824,6 +897,332 @@ impl Router {
     }
 }
 
+/// A courtesy the bridge owes Discord for a prompt it accepted: eyes on the
+/// message to say it was seen, and a typing indicator for as long as the
+/// answer is still being written. They travel on their own bounded queue with
+/// their own rate limit because they are not answers: dropping one must never
+/// delay or displace a reply, and the gateway read loop must never wait on
+/// Discord to post one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signal {
+    React {
+        channel_id: String,
+        message_id: String,
+    },
+    TypingStart {
+        channel_id: String,
+    },
+    TypingStop {
+        channel_id: String,
+    },
+    /// A command finished without producing an answer (the turn was
+    /// interrupted), so the prompt the agent was working on has to stop
+    /// claiming an answer is on its way.
+    TypingDropOldest,
+    TypingClear,
+}
+
+/// What an accepted prompt needs from the rest of the bridge: the channel its
+/// answer belongs to, and the courtesies Discord is told about while that
+/// answer is being written. Both are keyed to the same prompt, so they travel
+/// together.
+#[derive(Clone)]
+pub struct Intake {
+    router: Arc<Router>,
+    signals: Signals,
+}
+
+impl Intake {
+    fn new(fallback_channel: &str, signals: Signals) -> Self {
+        Self {
+            router: Arc::new(Router::new(fallback_channel)),
+            signals,
+        }
+    }
+
+    /// The prompt is on its way to the agent: note where the answer goes, put
+    /// eyes on the message and start claiming the channel is being typed in.
+    fn claim(&self, channel_id: &str, message_id: &str) {
+        self.router.expect_reply(channel_id);
+        self.signals.react(channel_id, message_id);
+        self.signals.typing_start(channel_id);
+    }
+
+    fn take(&self) -> Option<String> {
+        self.router.take()
+    }
+}
+
+/// The handle the gateway and the reply relay push signals through.
+#[derive(Clone)]
+pub struct Signals {
+    inbox: mpsc::Sender<Signal>,
+    bridge: Arc<Bridge>,
+}
+
+impl Signals {
+    fn new(inbox: mpsc::Sender<Signal>, bridge: Arc<Bridge>) -> Self {
+        Self { inbox, bridge }
+    }
+
+    pub fn react(&self, channel_id: &str, message_id: &str) {
+        if channel_id.trim().is_empty() || message_id.trim().is_empty() {
+            return;
+        }
+        self.push(Signal::React {
+            channel_id: channel_id.to_string(),
+            message_id: message_id.to_string(),
+        });
+    }
+
+    pub fn typing_start(&self, channel_id: &str) {
+        if channel_id.trim().is_empty() {
+            return;
+        }
+        self.push(Signal::TypingStart {
+            channel_id: channel_id.to_string(),
+        });
+    }
+
+    pub fn typing_stop(&self, channel_id: &str) {
+        if channel_id.trim().is_empty() {
+            return;
+        }
+        self.push(Signal::TypingStop {
+            channel_id: channel_id.to_string(),
+        });
+    }
+
+    pub fn typing_drop_oldest(&self) {
+        self.push(Signal::TypingDropOldest);
+    }
+
+    pub fn typing_clear(&self) {
+        self.push(Signal::TypingClear);
+    }
+
+    /// Best effort by design: a stalled Discord REST call must not back the
+    /// agent or the gateway up, so a full queue drops the signal and says so,
+    /// because a silent courtesy looks like a bot that ignored you.
+    fn push(&self, signal: Signal) {
+        if self.inbox.try_send(signal).is_err() {
+            self.bridge
+                .note("discord: the reaction/typing queue is full, so a signal was dropped");
+        }
+    }
+}
+
+/// The channels the bot is currently "typing" in. An episode is opened per
+/// prompt, not per channel, so a second prompt in the same channel keeps the
+/// indicator up while the first answer is being posted.
+#[derive(Debug, Default)]
+pub struct TypingBoard {
+    episodes: HashMap<String, Episode>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Episode {
+    started: tokio::time::Instant,
+    next_ping: tokio::time::Instant,
+    owed: u32,
+}
+
+impl TypingBoard {
+    /// Returns true when this opened a fresh episode, which is pinged at once.
+    fn start(&mut self, channel_id: &str, now: tokio::time::Instant) -> bool {
+        if let Some(episode) = self.episodes.get_mut(channel_id) {
+            episode.owed += 1;
+            return false;
+        }
+        self.episodes.insert(
+            channel_id.to_string(),
+            Episode {
+                started: now,
+                next_ping: now,
+                owed: 1,
+            },
+        );
+        true
+    }
+
+    /// Returns true when the channel stopped typing, which is when the last
+    /// prompt owed an answer in it gets one.
+    fn stop(&mut self, channel_id: &str) -> bool {
+        let owed = match self.episodes.get_mut(channel_id) {
+            Some(episode) => {
+                episode.owed = episode.owed.saturating_sub(1);
+                episode.owed
+            }
+            None => return false,
+        };
+        if owed > 0 {
+            return false;
+        }
+        self.episodes.remove(channel_id);
+        true
+    }
+
+    /// The channels due a ping, and the ones abandoned: the agent only ever
+    /// owes an answer while it is busy, so an episode that has outlasted every
+    /// plausible turn is a lost stop rather than work in progress.
+    fn due(&mut self, now: tokio::time::Instant) -> (Vec<String>, Vec<String>) {
+        let abandoned = self
+            .episodes
+            .iter()
+            .filter(|(_, episode)| now.duration_since(episode.started) >= TYPING_CAP)
+            .map(|(channel_id, _)| channel_id.clone())
+            .collect::<Vec<_>>();
+        for channel_id in &abandoned {
+            self.episodes.remove(channel_id);
+        }
+        let mut due = self
+            .episodes
+            .iter()
+            .filter(|(_, episode)| now >= episode.next_ping)
+            .map(|(channel_id, _)| channel_id.clone())
+            .collect::<Vec<_>>();
+        due.sort();
+        (due, abandoned)
+    }
+
+    fn pinged(&mut self, channel_id: &str, now: tokio::time::Instant) {
+        if let Some(episode) = self.episodes.get_mut(channel_id) {
+            episode.next_ping = now + TYPING_REFRESH;
+        }
+    }
+
+    /// Drops the longest-open episode: the turn that ended without an answer
+    /// was working the oldest prompt in the queue.
+    fn drop_oldest(&mut self) -> Option<String> {
+        let oldest = self
+            .episodes
+            .iter()
+            .min_by_key(|(_, episode)| episode.started)?
+            .0
+            .clone();
+        self.episodes.remove(&oldest);
+        Some(oldest)
+    }
+
+    fn clear(&mut self) -> usize {
+        let open = self.episodes.len();
+        self.episodes.clear();
+        open
+    }
+
+    pub fn open(&self) -> usize {
+        self.episodes.len()
+    }
+}
+
+/// Posts the signals: one reaction per accepted prompt, then a typing ping
+/// every `TYPING_TICK` while an episode is open, since Discord lets its own
+/// "typing" banner expire after about 10 s.
+struct SignalTask<P: Poster> {
+    poster: P,
+    bucket: Bucket,
+    bridge: Arc<Bridge>,
+    board: TypingBoard,
+}
+
+impl SignalTask<RestPoster> {
+    fn new(config: DiscordConfig, bridge: Arc<Bridge>) -> SignalTask<RestPoster> {
+        SignalTask {
+            poster: RestPoster {
+                http: reqwest::Client::new(),
+                config,
+            },
+            bucket: Bucket::new(SIGNALS_PER_WINDOW, SIGNAL_WINDOW),
+            bridge,
+            board: TypingBoard::default(),
+        }
+    }
+}
+
+impl<P: Poster> SignalTask<P> {
+    async fn run(mut self, mut inbox: mpsc::Receiver<Signal>) {
+        let mut tick = tokio::time::interval(TYPING_TICK);
+        loop {
+            tokio::select! {
+                signal = inbox.recv() => {
+                    let Some(signal) = signal else { break };
+                    self.handle(signal).await;
+                }
+                _ = tick.tick() => self.ping_due().await,
+            }
+        }
+    }
+
+    async fn handle(&mut self, signal: Signal) {
+        match signal {
+            Signal::React {
+                channel_id,
+                message_id,
+            } => {
+                let target = format!("#{channel_id}");
+                let call = Call::react(&channel_id, &message_id, EYES);
+                match deliver(&self.poster, &mut self.bucket, call).await {
+                    Delivery::Sent => self.bridge.note_reaction(),
+                    Delivery::Failed(message) => {
+                        self.bridge.note_reaction_failure(&target, &message)
+                    }
+                    Delivery::GaveUp { attempts, message } => self.bridge.note_reaction_failure(
+                        &target,
+                        &format!("{message} (after {attempts} attempts)"),
+                    ),
+                }
+            }
+            Signal::TypingStart { channel_id } => {
+                if self.board.start(&channel_id, tokio::time::Instant::now()) {
+                    self.ping(&channel_id).await;
+                }
+            }
+            Signal::TypingStop { channel_id } => {
+                self.board.stop(&channel_id);
+            }
+            Signal::TypingDropOldest => {
+                if let Some(channel_id) = self.board.drop_oldest() {
+                    self.bridge.note(&format!(
+                        "discord: no answer came for #{channel_id}, so its typing indicator \
+                         was dropped"
+                    ));
+                }
+            }
+            Signal::TypingClear => {
+                self.board.clear();
+            }
+        }
+    }
+
+    async fn ping_due(&mut self) {
+        let (due, abandoned) = self.board.due(tokio::time::Instant::now());
+        for channel_id in abandoned {
+            self.bridge.note(&format!(
+                "discord: #{channel_id} has waited over {}s for an answer, so its typing \
+                 indicator stopped",
+                TYPING_CAP.as_secs()
+            ));
+        }
+        for channel_id in due {
+            self.ping(&channel_id).await;
+        }
+    }
+
+    /// A typing ping is a heartbeat, not a message: one that fails is made up
+    /// on the next tick, so it is tried once and never retried.
+    async fn ping(&mut self, channel_id: &str) {
+        let now = tokio::time::Instant::now();
+        self.board.pinged(channel_id, now);
+        self.bucket.acquire().await;
+        if let Err((message, _)) = self.poster.post(&Call::typing(channel_id)).await {
+            self.bridge
+                .note_typing_failure(&format!("#{channel_id}"), &message);
+        } else {
+            self.bridge.note_typing();
+        }
+    }
+}
+
 /// Start the bridge and hand back the status the TUI reads for `/discord`.
 /// `console` is true when no TUI is drawing on the terminal (print/headless
 /// runs), which is the only case where notes go to stderr.
@@ -849,23 +1248,26 @@ pub fn spawn(
              server with it can drive the agent; set discord.allowed_user_id to lock it down",
         );
     }
-    let router = Arc::new(Router::new(&config.discord.channel_id));
     let (outbox_tx, outbox_rx) = mpsc::channel::<Posted>(OUTBOX_DEPTH);
+    let (signal_tx, signal_rx) = mpsc::channel::<Signal>(SIGNAL_DEPTH);
+    let signals = Signals::new(signal_tx, bridge.clone());
+    let intake = Intake::new(&config.discord.channel_id, signals);
+    tokio::spawn(SignalTask::new(config.discord.clone(), bridge.clone()).run(signal_rx));
     tokio::spawn(reply_relay(
         events.subscribe(),
         outbox_tx,
-        router.clone(),
+        intake.clone(),
         bridge.clone(),
     ));
     tokio::spawn(Outbox::new(config.discord.clone(), outbox_rx, bridge.clone()).run());
-    tokio::spawn(connect_loop(config, agent_tx, router, bridge.clone()));
+    tokio::spawn(connect_loop(config, agent_tx, intake, bridge.clone()));
     bridge
 }
 
 async fn connect_loop(
     config: Config,
     agent_tx: mpsc::UnboundedSender<AgentCommand>,
-    router: Arc<Router>,
+    intake: Intake,
     bridge: Arc<Bridge>,
 ) {
     let mut session = GatewaySession::default();
@@ -876,7 +1278,7 @@ async fn connect_loop(
         let outcome = gateway_session(
             &config,
             &agent_tx,
-            &router,
+            &intake,
             &mut session,
             &mut backoff,
             intents,
@@ -924,7 +1326,7 @@ async fn connect_loop(
 async fn gateway_session(
     config: &Config,
     agent_tx: &mpsc::UnboundedSender<AgentCommand>,
-    router: &Router,
+    intake: &Intake,
     session: &mut GatewaySession,
     backoff: &mut Backoff,
     intents: u64,
@@ -1032,7 +1434,7 @@ async fn gateway_session(
                                 if value["t"].as_str() == Some("MESSAGE_CREATE") =>
                             {
                                 let inbound =
-                                    route_message(&config.discord, &value["d"], agent_tx, router);
+                                    route_message(&config.discord, &value["d"], agent_tx, intake);
                                 bridge.note_inbound(&value["d"], &inbound);
                                 let guild = is_guild_message(&value["d"]);
                                 if let Some(note) = notices.notice(&inbound, guild) {
@@ -1159,7 +1561,7 @@ fn route_message(
     config: &DiscordConfig,
     d: &Value,
     agent_tx: &mpsc::UnboundedSender<AgentCommand>,
-    router: &Router,
+    intake: &Intake,
 ) -> Inbound {
     let inbound = accept_message(d, &config.allowed_user_id);
     let Inbound::Prompted { channel_id, text } = &inbound else {
@@ -1170,7 +1572,7 @@ fn route_message(
             "the agent is not accepting prompts ({e})"
         )));
     }
-    router.expect_reply(channel_id);
+    intake.claim(channel_id, d["id"].as_str().unwrap_or(""));
     inbound
 }
 
@@ -1212,14 +1614,30 @@ async fn read_json<T: serde::de::DeserializeOwned>(ws: &mut Ws) -> anyhow::Resul
 async fn reply_relay(
     mut events: broadcast::Receiver<AgentEvent>,
     outbox: mpsc::Sender<Posted>,
-    router: Arc<Router>,
+    intake: Intake,
     bridge: Arc<Bridge>,
 ) {
+    let mut answered = false;
     loop {
         let text = match events.recv().await {
-            Ok(AgentEvent::AssistantDone { text }) | Ok(AgentEvent::Error(text)) => text,
+            Ok(AgentEvent::AssistantDone { text }) | Ok(AgentEvent::Error(text)) => {
+                answered = true;
+                text
+            }
+            Ok(AgentEvent::Idle) => {
+                // The agent is idle, so nothing is being written any more. If
+                // no answer came for the prompt it was working (an interrupted
+                // turn), that prompt still thinks it is owed one.
+                if !answered {
+                    intake.signals.typing_drop_oldest();
+                }
+                answered = false;
+                continue;
+            }
             Ok(_) => continue,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                answered = false;
+                intake.signals.typing_clear();
                 bridge.fail(&format!(
                     "discord: fell behind the event stream and lost {skipped} event(s), an \
                      answer may never have been posted"
@@ -1227,15 +1645,17 @@ async fn reply_relay(
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => {
+                intake.signals.typing_clear();
                 bridge.fail("discord: the agent shut down, so no more replies will be posted");
                 break;
             }
         };
-        let Some(channel_id) = router.take() else {
+        let Some(channel_id) = intake.take() else {
             continue;
         };
         let chunks = chunk_message(&text);
         if chunks.is_empty() {
+            intake.signals.typing_stop(&channel_id);
             bridge.fail(&format!(
                 "discord: the answer for #{channel_id} had no text, so nothing was posted"
             ));
@@ -1243,6 +1663,7 @@ async fn reply_relay(
         }
         bridge.note_answer(&channel_id, chunks.len());
         let dropped = push_chunks(&outbox, &channel_id, &chunks);
+        intake.signals.typing_stop(&channel_id);
         if dropped > 0 {
             bridge.fail(&format!(
                 "discord: dropped {dropped} reply chunk(s) for #{channel_id}, outbox full"
@@ -1257,8 +1678,40 @@ pub struct Posted {
     pub text: String,
 }
 
+/// One Discord REST call. Answers, reactions and typing pings are all POSTs
+/// that differ only in endpoint and body, so they share the retry and
+/// rate-limit machinery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    pub url: String,
+    pub body: Option<Value>,
+}
+
+impl Call {
+    pub fn message(channel_id: &str, text: &str) -> Self {
+        Self {
+            url: send_url(channel_id),
+            body: Some(json!({ "content": text })),
+        }
+    }
+
+    pub fn react(channel_id: &str, message_id: &str, emoji: &str) -> Self {
+        Self {
+            url: reaction_url(channel_id, message_id, emoji),
+            body: None,
+        }
+    }
+
+    pub fn typing(channel_id: &str) -> Self {
+        Self {
+            url: typing_url(channel_id),
+            body: None,
+        }
+    }
+}
+
 trait Poster {
-    async fn post(&self, channel_id: &str, text: &str) -> Result<(), (String, Retry)>;
+    async fn post(&self, call: &Call) -> Result<(), (String, Retry)>;
 }
 
 #[derive(Debug, PartialEq)]
@@ -1268,17 +1721,12 @@ pub enum Delivery {
     GaveUp { attempts: u32, message: String },
 }
 
-async fn deliver<P: Poster + ?Sized>(
-    post: &P,
-    bucket: &mut Bucket,
-    channel_id: &str,
-    text: &str,
-) -> Delivery {
+async fn deliver<P: Poster + ?Sized>(post: &P, bucket: &mut Bucket, call: Call) -> Delivery {
     let mut attempts = 0;
     loop {
         bucket.acquire().await;
         attempts += 1;
-        match post.post(channel_id, text).await {
+        match post.post(&call).await {
             Ok(()) => return Delivery::Sent,
             Err((message, Retry::Stop)) => return Delivery::Failed(message),
             Err((message, Retry::Wait(wait))) => {
@@ -1314,14 +1762,8 @@ impl Outbox {
     async fn run(mut self) {
         while let Some(posted) = self.outbox.recv().await {
             let target = format!("#{}", posted.channel_id.trim());
-            match deliver(
-                &self.poster,
-                &mut self.bucket,
-                &posted.channel_id,
-                &posted.text,
-            )
-            .await
-            {
+            let call = Call::message(&posted.channel_id, &posted.text);
+            match deliver(&self.poster, &mut self.bucket, call).await {
                 Delivery::Sent => self.bridge.note_reply_posted(1),
                 Delivery::Failed(message) => {
                     self.bridge
@@ -1349,20 +1791,51 @@ pub fn send_url(channel_id: &str) -> String {
     )
 }
 
+pub fn reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
+    format!(
+        "https://discord.com/api/v10/channels/{}/messages/{}/reactions/@me/{}",
+        channel_id.trim(),
+        message_id.trim(),
+        encode_emoji(emoji)
+    )
+}
+
+pub fn typing_url(channel_id: &str) -> String {
+    format!(
+        "https://discord.com/api/v10/channels/{}/typing",
+        channel_id.trim()
+    )
+}
+
+/// Discord wants a unicode emoji percent-encoded in the reaction path, so the
+/// eyes go out as `%F0%9F%91%80`.
+pub fn encode_emoji(emoji: &str) -> String {
+    let mut encoded = String::new();
+    for byte in emoji.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 pub fn auth_header(bot_token: &str) -> String {
     format!("Bot {}", bot_token.trim())
 }
 
 impl Poster for RestPoster {
-    async fn post(&self, channel_id: &str, text: &str) -> Result<(), (String, Retry)> {
-        let response = self
-            .http
-            .post(send_url(channel_id))
-            .header(
-                reqwest::header::AUTHORIZATION,
-                auth_header(&self.config.bot_token),
-            )
-            .json(&json!({ "content": text }))
+    async fn post(&self, call: &Call) -> Result<(), (String, Retry)> {
+        let mut request = self.http.post(&call.url).header(
+            reqwest::header::AUTHORIZATION,
+            auth_header(&self.config.bot_token),
+        );
+        if let Some(body) = &call.body {
+            request = request.json(body);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| (e.to_string(), Retry::Wait(RETRY_WAIT)))?;
@@ -1565,6 +2038,23 @@ mod tests {
         let line = arrival(&direct(&text), &prompted("7", &text), None);
         assert!(line.contains(&format!("\"{}…\"", "x".repeat(60))), "{line}");
         assert!(line.chars().count() < 120, "{line}");
+    }
+
+    /// An intake for the fallback channel, with the signal queue left unread so
+    /// a test can see which courtesies the bridge asked for.
+    fn intake(fallback: &str) -> (Intake, mpsc::Receiver<Signal>) {
+        let (signals, received) = signal_queue();
+        (Intake::new(fallback, signals), received)
+    }
+
+    /// A signal queue the bridge can push into without a task reading it back.
+    fn signal_queue() -> (Signals, mpsc::Receiver<Signal>) {
+        let (events, _notes) = broadcast::channel(8);
+        let (inbox, received) = mpsc::channel(SIGNAL_DEPTH);
+        (
+            Signals::new(inbox, Arc::new(Bridge::new(&config("9"), events, false))),
+            received,
+        )
     }
 
     fn bridge(console: bool) -> (Arc<Bridge>, broadcast::Receiver<AgentEvent>) {
@@ -1932,13 +2422,14 @@ mod tests {
     #[tokio::test]
     async fn an_answer_with_no_text_says_nothing_was_posted() {
         let (events, mut notes) = broadcast::channel(16);
+        let (intake, _inbox) = intake("123");
         let bridge = Arc::new(Bridge::new(&config("123"), events.clone(), false));
         let (outbox, mut posted) = mpsc::channel(4);
         let relay_outbox = outbox.clone();
         tokio::spawn(reply_relay(
             events.subscribe(),
             relay_outbox,
-            Arc::new(Router::new("123")),
+            intake.clone(),
             bridge.clone(),
         ));
 
@@ -1957,13 +2448,14 @@ mod tests {
     #[tokio::test]
     async fn a_full_outbox_reports_the_chunks_it_drops() {
         let (events, mut notes) = broadcast::channel(16);
+        let (intake, _inbox) = intake("123");
         let bridge = Arc::new(Bridge::new(&config("123"), events.clone(), false));
         let (outbox, mut posted) = mpsc::channel(1);
         let relay_outbox = outbox.clone();
         tokio::spawn(reply_relay(
             events.subscribe(),
             relay_outbox,
-            Arc::new(Router::new("123")),
+            intake.clone(),
             bridge.clone(),
         ));
 
@@ -2001,7 +2493,7 @@ mod tests {
     }
 
     impl Poster for ScriptedPoster {
-        async fn post(&self, _channel_id: &str, _text: &str) -> Result<(), (String, Retry)> {
+        async fn post(&self, _call: &Call) -> Result<(), (String, Retry)> {
             self.attempts.set(self.attempts.get() + 1);
             self.script
                 .borrow_mut()
@@ -2019,7 +2511,7 @@ mod tests {
         ]);
         let mut bucket = Bucket::new(SENDS_PER_WINDOW, SEND_WINDOW);
         assert_eq!(
-            deliver(&poster, &mut bucket, "9", "hi").await,
+            deliver(&poster, &mut bucket, Call::message("9", "hi")).await,
             Delivery::Sent
         );
         assert_eq!(poster.attempts.get(), 3);
@@ -2034,7 +2526,7 @@ mod tests {
         ]);
         let mut bucket = Bucket::new(SENDS_PER_WINDOW, SEND_WINDOW);
         assert_eq!(
-            deliver(&poster, &mut bucket, "9", "hi").await,
+            deliver(&poster, &mut bucket, Call::message("9", "hi")).await,
             Delivery::GaveUp {
                 attempts: MAX_SEND_ATTEMPTS,
                 message: "discord REST 429: slow down".to_string(),
@@ -2051,7 +2543,7 @@ mod tests {
         ))]);
         let mut bucket = Bucket::new(SENDS_PER_WINDOW, SEND_WINDOW);
         assert_eq!(
-            deliver(&poster, &mut bucket, "9", "hi").await,
+            deliver(&poster, &mut bucket, Call::message("9", "hi")).await,
             Delivery::Failed("discord REST 403: missing permissions".to_string())
         );
         assert_eq!(poster.attempts.get(), 1);
@@ -2064,7 +2556,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         for _ in 0..5 {
             assert_eq!(
-                deliver(&poster, &mut bucket, "9", "hi").await,
+                deliver(&poster, &mut bucket, Call::message("9", "hi")).await,
                 Delivery::Sent
             );
         }
@@ -2085,14 +2577,14 @@ mod tests {
     #[test]
     fn routes_messages_from_any_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let router = Router::new("7");
+        let (intake, _inbox) = intake("7");
         let message = json!({
             "channel_id": "9", "guild_id": "1", "content":  "  build it  ",
             "author": {"bot": false, "id": "42"}
         });
 
         assert_eq!(
-            route_message(&config("9"), &message, &tx, &router),
+            route_message(&config("9"), &message, &tx, &intake),
             prompted("9", "build it")
         );
         assert_eq!(
@@ -2101,7 +2593,7 @@ mod tests {
         );
 
         assert_eq!(
-            route_message(&config("7"), &message, &tx, &router),
+            route_message(&config("7"), &message, &tx, &intake),
             prompted("9", "build it")
         );
         assert_eq!(
@@ -2113,7 +2605,7 @@ mod tests {
             "channel_id": "9", "content": "dm prompt", "author": {"bot": false, "id": "42"}
         });
         assert_eq!(
-            route_message(&config("7"), &dm, &tx, &router),
+            route_message(&config("7"), &dm, &tx, &intake),
             prompted("9", "dm prompt")
         );
         assert_eq!(
@@ -2126,7 +2618,7 @@ mod tests {
             ..config("9")
         };
         assert_eq!(
-            route_message(&restricted, &message, &tx, &router),
+            route_message(&restricted, &message, &tx, &intake),
             Inbound::Ignored(Ignore::DisallowedUser("42".to_string()))
         );
         assert!(rx.try_recv().is_err());
@@ -2135,37 +2627,37 @@ mod tests {
     #[test]
     fn routed_messages_retarget_the_reply() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let router = Router::new("7");
+        let (intake, _inbox) = intake("7");
         let guild = json!({
             "channel_id": "9", "guild_id": "1", "content": "build it",
             "author": {"bot": false, "id": "42"}
         });
 
-        assert_eq!(router.take().as_deref(), Some("7"));
-        route_message(&config("9"), &guild, &tx, &router);
+        assert_eq!(intake.take().as_deref(), Some("7"));
+        route_message(&config("9"), &guild, &tx, &intake);
         assert_eq!(rx.try_recv().unwrap().text_or_debug(), "build it");
-        assert_eq!(router.take().as_deref(), Some("9"));
+        assert_eq!(intake.take().as_deref(), Some("9"));
 
         let dm = json!({
             "channel_id": "77", "content": "hello", "author": {"bot": false, "id": "42"}
         });
-        route_message(&config("9"), &dm, &tx, &router);
+        route_message(&config("9"), &dm, &tx, &intake);
         assert_eq!(rx.try_recv().unwrap().text_or_debug(), "hello");
-        assert_eq!(router.take().as_deref(), Some("77"));
-        assert_eq!(router.take().as_deref(), Some("7"));
+        assert_eq!(intake.take().as_deref(), Some("77"));
+        assert_eq!(intake.take().as_deref(), Some("7"));
     }
 
     #[test]
     fn ignored_messages_do_not_claim_an_answer() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let router = Router::new("7");
+        let (intake, _inbox) = intake("7");
 
         let blank = json!({
             "channel_id": "77", "guild_id": "1", "content": "   ",
             "author": {"bot": false, "id": "42"}
         });
         assert_eq!(
-            route_message(&config("7"), &blank, &tx, &router),
+            route_message(&config("7"), &blank, &tx, &intake),
             Inbound::Ignored(Ignore::NoText)
         );
 
@@ -2174,21 +2666,21 @@ mod tests {
             "author": {"bot": true, "id": "42"}
         });
         assert_eq!(
-            route_message(&config("7"), &from_bot, &tx, &router),
+            route_message(&config("7"), &from_bot, &tx, &intake),
             Inbound::Ignored(Ignore::FromBot)
         );
 
         assert!(rx.try_recv().is_err());
-        assert_eq!(router.take().as_deref(), Some("7"));
+        assert_eq!(intake.take().as_deref(), Some("7"));
     }
 
     #[test]
     fn a_prompt_the_agent_will_not_take_is_reported_as_undelivered() {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let router = Router::new("7");
+        let (intake, _inbox) = intake("7");
 
-        let inbound = route_message(&config("9"), &posted("build it"), &tx, &router);
+        let inbound = route_message(&config("9"), &posted("build it"), &tx, &intake);
         let Inbound::Ignored(Ignore::NotDelivered(reason)) = &inbound else {
             panic!("expected an undelivered message, got {inbound:?}");
         };
@@ -2196,7 +2688,7 @@ mod tests {
         let line = arrival(&posted("build it"), &inbound, Some("Work"));
         assert!(line.contains("not queued"), "{line}");
         assert!(line.contains("@alice"), "{line}");
-        assert_eq!(router.take().as_deref(), Some("7"));
+        assert_eq!(intake.take().as_deref(), Some("7"));
     }
 
     #[tokio::test]
@@ -2272,6 +2764,396 @@ mod tests {
         assert_eq!(error.close_code, DISALLOWED_INTENTS);
         assert_eq!(error.reconnect, Reconnect::Fatal);
         assert_eq!(close_error(None).close_code, 0);
+    }
+
+    #[test]
+    fn eyes_and_typing_have_their_own_endpoints() {
+        assert_eq!(encode_emoji("\u{1f440}"), "%F0%9F%91%80");
+        assert_eq!(encode_emoji("rho:1"), "rho%3A1");
+        assert_eq!(
+            reaction_url("9", "55", EYES),
+            "https://discord.com/api/v10/channels/9/messages/55/reactions/@me/%F0%9F%91%80"
+        );
+        assert_eq!(
+            typing_url(" 9 "),
+            "https://discord.com/api/v10/channels/9/typing"
+        );
+        assert_eq!(
+            Call::typing("9"),
+            Call {
+                url: typing_url("9"),
+                body: None
+            }
+        );
+        assert_eq!(
+            Call::message("9", "hi").body,
+            Some(json!({ "content": "hi" }))
+        );
+        assert_eq!(Call::react("9", "55", EYES).body, None);
+    }
+
+    #[test]
+    fn an_accepted_prompt_asks_for_eyes_and_typing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (intake, mut inbox) = intake("7");
+        let message = json!({
+            "id": "55", "channel_id": "9", "content": "build it",
+            "author": {"bot": false, "id": "42"}
+        });
+
+        assert_eq!(
+            route_message(&config("9"), &message, &tx, &intake),
+            prompted("9", "build it")
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().text_or_debug(),
+            "build it".to_string()
+        );
+        assert_eq!(
+            inbox.try_recv().unwrap(),
+            Signal::React {
+                channel_id: "9".to_string(),
+                message_id: "55".to_string()
+            }
+        );
+        assert_eq!(
+            inbox.try_recv().unwrap(),
+            Signal::TypingStart {
+                channel_id: "9".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_message_that_is_not_a_prompt_asks_for_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (intake, mut inbox) = intake("7");
+        let from_bot = json!({
+            "id": "55", "channel_id": "9", "content": "echo",
+            "author": {"bot": true, "id": "42"}
+        });
+
+        assert_eq!(
+            route_message(&config("9"), &from_bot, &tx, &intake),
+            Inbound::Ignored(Ignore::FromBot)
+        );
+        assert!(inbox.try_recv().is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_prompt_in_the_same_channel_keeps_typing() {
+        let now = tokio::time::Instant::now();
+        let mut board = TypingBoard::default();
+        assert!(board.start("9", now));
+        assert!(!board.start("9", now + Duration::from_secs(1)));
+        assert_eq!(board.open(), 1);
+        assert!(!board.stop("9"));
+        assert!(board.stop("9"));
+        assert!(!board.stop("9"));
+        assert_eq!(board.open(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_pings_repeat_until_the_answer_lands() {
+        let start = tokio::time::Instant::now();
+        let mut board = TypingBoard::default();
+        board.start("9", start);
+        assert_eq!(board.due(start).0, vec!["9".to_string()]);
+        board.pinged("9", start);
+        assert!(board.due(start + TYPING_TICK / 2).0.is_empty());
+        assert_eq!(board.due(start + TYPING_TICK).0, vec!["9".to_string()]);
+        assert!(board.stop("9"));
+        assert!(board.due(start + TYPING_TICK * 2).0.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_oldest_prompt_loses_its_indicator_when_no_answer_comes() {
+        let start = tokio::time::Instant::now();
+        let mut board = TypingBoard::default();
+        board.start("9", start);
+        board.start("77", start + Duration::from_secs(2));
+        assert_eq!(board.drop_oldest().as_deref(), Some("9"));
+        assert_eq!(board.drop_oldest().as_deref(), Some("77"));
+        assert_eq!(board.drop_oldest(), None);
+        board.start("9", start);
+        board.start("77", start);
+        assert_eq!(board.clear(), 2);
+        assert_eq!(board.open(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_episode_outlasting_every_answer_is_abandoned() {
+        let start = tokio::time::Instant::now();
+        let mut board = TypingBoard::default();
+        board.start("9", start);
+        board.pinged("9", start);
+        let (due, abandoned) = board.due(start + TYPING_CAP);
+        assert!(due.is_empty());
+        assert_eq!(abandoned, vec!["9".to_string()]);
+        assert_eq!(board.open(), 0);
+    }
+
+    #[derive(Default)]
+    struct RecordingPoster {
+        calls: Mutex<Vec<Call>>,
+    }
+
+    impl RecordingPoster {
+        fn count(&self, needle: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.url.contains(needle))
+                .count()
+        }
+
+        fn url(&self, index: usize) -> String {
+            self.calls.lock().unwrap()[index].url.clone()
+        }
+    }
+
+    impl Poster for RecordingPoster {
+        async fn post(&self, call: &Call) -> Result<(), (String, Retry)> {
+            self.calls.lock().unwrap().push(call.clone());
+            Ok(())
+        }
+    }
+
+    impl<P: Poster + ?Sized> Poster for Arc<P> {
+        async fn post(&self, call: &Call) -> Result<(), (String, Retry)> {
+            (**self).post(call).await
+        }
+    }
+
+    async fn wait_until(done: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the signal task never caught up");
+    }
+
+    async fn next_bridge_note(notes: &mut broadcast::Receiver<AgentEvent>) -> String {
+        loop {
+            match notes.recv().await {
+                Ok(AgentEvent::Info(text)) => return text,
+                Ok(_) => continue,
+                Err(e) => panic!("the event stream ended: {e}"),
+            }
+        }
+    }
+
+    fn signal_task(
+        poster: Arc<RecordingPoster>,
+    ) -> (
+        SignalTask<Arc<RecordingPoster>>,
+        Arc<Bridge>,
+        broadcast::Receiver<AgentEvent>,
+    ) {
+        let (events, notes) = broadcast::channel(64);
+        let bridge = Arc::new(Bridge::new(&config("123"), events, false));
+        (
+            SignalTask {
+                poster,
+                bucket: Bucket::new(SIGNALS_PER_WINDOW, SIGNAL_WINDOW),
+                bridge: bridge.clone(),
+                board: TypingBoard::default(),
+            },
+            bridge,
+            notes,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eyes_go_on_the_prompt_and_typing_keeps_up_until_it_is_answered() {
+        let poster = Arc::new(RecordingPoster::default());
+        let (task, bridge, _notes) = signal_task(poster.clone());
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(task.run(rx));
+
+        tx.send(Signal::React {
+            channel_id: "9".to_string(),
+            message_id: "55".to_string(),
+        })
+        .await
+        .unwrap();
+        wait_until(|| poster.count("reactions") == 1).await;
+        assert!(
+            poster
+                .url(0)
+                .ends_with("messages/55/reactions/@me/%F0%9F%91%80"),
+            "{}",
+            poster.url(0)
+        );
+
+        tx.send(Signal::TypingStart {
+            channel_id: "9".to_string(),
+        })
+        .await
+        .unwrap();
+        wait_until(|| poster.count("typing") == 1).await;
+
+        tokio::time::sleep(TYPING_TICK + Duration::from_secs(1)).await;
+        assert_eq!(poster.count("typing"), 2, "the indicator is kept alive");
+
+        tx.send(Signal::TypingStop {
+            channel_id: "9".to_string(),
+        })
+        .await
+        .unwrap();
+        tx.send(Signal::React {
+            channel_id: "9".to_string(),
+            message_id: "56".to_string(),
+        })
+        .await
+        .unwrap();
+        wait_until(|| poster.count("reactions") == 2).await;
+        tokio::time::sleep(TYPING_TICK * 3).await;
+        assert_eq!(poster.count("typing"), 2, "stopping really stops");
+
+        let summary = bridge.summary();
+        assert!(summary.contains("2 reaction(s) added"), "{summary}");
+        assert!(summary.contains("2 typing indicator(s) sent"), "{summary}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_typing_episode_says_so() {
+        let poster = Arc::new(RecordingPoster::default());
+        let (task, bridge, mut notes) = signal_task(poster.clone());
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(task.run(rx));
+
+        tx.send(Signal::TypingStart {
+            channel_id: "9".to_string(),
+        })
+        .await
+        .unwrap();
+        wait_until(|| poster.count("typing") == 1).await;
+        tx.send(Signal::TypingDropOldest).await.unwrap();
+        let dropped = next_bridge_note(&mut notes).await;
+        assert!(dropped.contains("#9"), "{dropped}");
+
+        tx.send(Signal::TypingStart {
+            channel_id: "77".to_string(),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(TYPING_CAP + Duration::from_secs(1)).await;
+        let abandoned = next_bridge_note(&mut notes).await;
+        assert!(abandoned.contains("#77"), "{abandoned}");
+        assert!(abandoned.contains("stopped"), "{abandoned}");
+        assert!(
+            !bridge.summary().contains("refused"),
+            "{}",
+            bridge.summary()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_stops_the_typing_indicator() {
+        let (events, _notes) = broadcast::channel(16);
+        let (outbox, mut posted) = mpsc::channel(4);
+        let (intake, mut inbox) = intake("123");
+        let bridge = Arc::new(Bridge::new(&config("123"), events.clone(), false));
+        tokio::spawn(reply_relay(
+            events.subscribe(),
+            outbox,
+            intake.clone(),
+            bridge.clone(),
+        ));
+
+        events
+            .send(AgentEvent::AssistantDone {
+                text: "done".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            next_signal(&mut inbox).await,
+            Signal::TypingStop {
+                channel_id: "123".to_string()
+            }
+        );
+        assert_eq!(posted.recv().await.unwrap().text, "done");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_turn_drops_the_indicator_it_owes() {
+        let (events, _notes) = broadcast::channel(16);
+        let (outbox, _posted) = mpsc::channel(4);
+        let (intake, mut inbox) = intake("123");
+        let bridge = Arc::new(Bridge::new(&config("123"), events.clone(), false));
+        tokio::spawn(reply_relay(
+            events.subscribe(),
+            outbox,
+            intake.clone(),
+            bridge.clone(),
+        ));
+
+        events.send(AgentEvent::Idle).unwrap();
+        assert_eq!(next_signal(&mut inbox).await, Signal::TypingDropOldest);
+
+        events
+            .send(AgentEvent::AssistantDone {
+                text: "done".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            next_signal(&mut inbox).await,
+            Signal::TypingStop {
+                channel_id: "123".to_string()
+            }
+        );
+        events.send(AgentEvent::Idle).unwrap();
+        expect_no_signal(&mut inbox).await;
+    }
+
+    async fn next_signal(inbox: &mut mpsc::Receiver<Signal>) -> Signal {
+        tokio::time::timeout(Duration::from_secs(2), inbox.recv())
+            .await
+            .expect("no signal reached the queue")
+            .expect("the signal queue closed")
+    }
+
+    async fn expect_no_signal(inbox: &mut mpsc::Receiver<Signal>) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(inbox.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_refused_reaction_is_complained_about_once() {
+        let (bridge, mut notes) = bridge(false);
+        bridge.note_reaction_failure("#9", "discord REST 403: Missing Permissions");
+        bridge.note_reaction_failure("#9", "discord REST 403: Missing Permissions");
+        assert!(matches!(
+            notes.recv().await,
+            Ok(AgentEvent::Fault(text)) if text.contains("Add Reactions")
+        ));
+        assert!(notes.try_recv().is_err());
+        let summary = bridge.summary();
+        assert!(
+            summary.contains("0 reaction(s) added (2 refused)"),
+            "{summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_typing_indicator_is_complained_about_once() {
+        let (bridge, mut notes) = bridge(false);
+        bridge.note_typing_failure("#9", "discord REST 403: Missing Permissions");
+        bridge.note_typing_failure("#9", "discord REST 403: Missing Permissions");
+        assert!(matches!(notes.recv().await, Ok(AgentEvent::Fault(_))));
+        assert!(notes.try_recv().is_err());
+        assert!(
+            bridge
+                .summary()
+                .contains("0 typing indicator(s) sent (2 refused)"),
+            "{}",
+            bridge.summary()
+        );
     }
 
     impl AgentCommand {

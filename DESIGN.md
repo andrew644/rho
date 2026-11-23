@@ -213,6 +213,20 @@ loop:
   `Authorization: Bot <token>` (Discord rejects `Bearer` for bot tokens with
   `401`) at 4 messages per 5 s, so chunk bursts stay under Discord's
   per-channel limit.
+- An accepted prompt is acknowledged on Discord itself: a 👀 reaction
+  (`POST /channels/{id}/messages/{id}/reactions/@me/%F0%9F%91%80`, unicode is
+  percent-encoded in the path) and a typing ping (`POST /channels/{id}/typing`)
+  refreshed every 8 s until the answer is handed to the outbox, since Discord
+  expires its own typing banner after about 10 s. Signals ride a bounded queue
+  with their own rate limit, so a refused or slow reaction can never delay a
+  reply, and the gateway read loop never waits on one. `TypingBoard` keeps one
+  episode per prompt (refcounted per channel, so a second prompt in a channel
+  keeps the banner up while the first answer is posted): the answer stops it, an
+  `Idle` with no answer before it drops the oldest episode (an interrupted turn
+  owes no reply), a lagged or closed event stream clears them all, and an
+  episode older than 5 min is abandoned with a note, so a lost stop cannot
+  pretend to type forever. Reactions need the *Add Reactions* permission; the
+  first refusal is reported as a fault naming it and the rest are only counted.
 - Silence is explained rather than guessed at, and the explanation is drawn in
   the rho window: the TUI owns the terminal, so every bridge note arrives as a
   transcript line (only headless runs, which have no TUI, write them to
@@ -228,8 +242,9 @@ loop:
   first frame that does not parse and the first binary frame each add a
   one-line explanation — the ones that mean rho cannot do what it was asked are
   sent as faults, the rest as notes. The bridge keeps a `Status` (state,
-  granted intents, servers, message and reply counters, last inbound line,
-  error count and last error) behind an `Arc<Mutex<_>>`, and the TUI renders it
+  granted intents, servers, message, reply, reaction and typing counters, last
+  inbound line, error count and last error) behind an `Arc<Mutex<_>>`, and the
+  TUI renders it
   for `/discord` one `StatusLine` at a time, each marked with whether it is
   reporting a fault so the broken parts come up as errors.
 - A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,

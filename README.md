@@ -172,6 +172,16 @@ it is empty anyone who can DM the bot or who shares a server with it can drive
 the agent, and rho warns about that at startup. Messages from bots are always
 ignored.
 
+Every prompt rho accepts puts a 👀 reaction on the message that asked for it,
+and the bot shows as typing in that channel until the answer is on its way
+back — refreshed every 8 s, because Discord lets its own typing banner expire
+after about 10 s. Reactions need the *Add Reactions* permission; *View
+Channel* and *Send Messages* are still all it takes to see a channel and
+answer in it. A refusal is reported once, names the permission it wanted, and
+says what it does not affect, because reactions are cosmetic: prompts and
+replies work without them. Messages rho does not accept — from a bot, from the
+wrong user, or with no text to read — get neither reaction nor typing.
+
 Reading text in a **server** channel needs the privileged *Message Content
 Intent*: without it Discord delivers `MESSAGE_CREATE` for server channels with
 an empty `content` field, so rho sees the message but has no text to enqueue
@@ -195,7 +205,7 @@ line, so if nothing appears at all, Discord never sent it:
   Content Intent* is not being applied.
 - `@bob in DM #7: ignored, user id 123 is not allowed_user_id` — right bot,
   wrong author; rho remembers the id it saw.
-- `discord gateway identified (intents 0x1900, message content granted)` —
+- `discord gateway identified (intents 0x1c01, message content granted)` —
   Discord confirms the intent on the live session; `WARNING: Discord did not
   grant the Message Content Intent` means the portal switch is off (or was
   saved after this session identified, so restart rho).
@@ -205,6 +215,9 @@ line, so if nothing appears at all, Discord never sent it:
 - `@alice in server "Work" #9: not queued — the agent is not accepting prompts
   (channel closed)` — the message reached the gateway but never reached the
   agent, so no answer was ever coming.
+- `discord: no answer came for #9, so its typing indicator was dropped` — the
+  turn was interrupted before it produced an answer, so nothing is still being
+  written in that channel.
 
 Anything the bridge *fails* to do is drawn as an error line (`! `, in red)
 rather than as a note (`· `): a gateway that closes, stops or loses the Message
@@ -212,21 +225,25 @@ Content Intent, the first server message that arrives with no text to read, a
 frame it cannot read (JSON that does not parse, or a binary frame from a session
 it cannot decode), a reply Discord refuses (`401` bad token, `403` missing
 permissions, a `429` that outlasts the retries), reply chunks dropped because
-the outbox is full, an answer that had no text to post, and a message that
-never reached the agent. So a bridge that is connected but not delivering is
-loud, not silent.
+the outbox is full, an answer that had no text to post, a reaction Discord
+refused (the first one, which names *Add Reactions*), a typing ping Discord
+refused, and a message that never reached the agent. So a bridge that is
+connected but not delivering is loud, not silent.
 
 `/discord` prints the same picture on demand: connection state, the intents
 Discord granted, the servers the bot can see, how many messages arrived, how
 many were queued as prompts, how many reply chunks went out, the last inbound
-line, how many errors were reported and the last of them (its own lines turn
+line, how many reactions and typing indicators went out and how many Discord
+refused, how many errors were reported and the last of them (its own lines turn
 red when they are reporting one). Messages from other bots are counted but only
 mentioned the first time, so a busy channel cannot push your transcript along.
 
 Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
 retried after the `Retry-After` Discord reports (up to 3 attempts); a full
 outbox drops the newest chunks instead of blocking the agent, and names the
-ones it dropped. Dropped gateway connections resume with `op 6` using the saved
+ones it dropped. Reactions and typing pings ride their own queue with their own
+4 per 5 s window, so a slow reaction cannot hold up a reply; a typing ping is
+tried once and made up on the next refresh, because a late one is worthless. Dropped gateway connections resume with `op 6` using the saved
 `session_id`/`seq` when possible, otherwise they re-identify, and reconnect
 waits back off from 1 s to 60 s. Authentication failures (`4004`, `4014`) stop
 the bridge instead of retrying; progress and failures are reported the same way
