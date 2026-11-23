@@ -175,10 +175,12 @@ ignored.
 Every prompt rho accepts puts a 👀 reaction on the message that asked for it,
 and the bot shows as typing in that channel until the answer is on its way
 back — refreshed every 8 s, because Discord lets its own typing banner expire
-after about 10 s. Reactions need the *Add Reactions* permission; *View
-Channel* and *Send Messages* are still all it takes to see a channel and
-answer in it. A refusal is reported once, names the permission it wanted, and
-says what it does not affect, because reactions are cosmetic: prompts and
+after about 10 s. In a server, reactions need the *Add Reactions* **and**
+*Read Message History* permissions (Discord wants the second one to create a
+reaction, not only the first); *View Channel* and *Send Messages* are still all
+it takes to see a channel and answer in it, and direct messages need none of
+them. A refusal is reported once, names the permissions it wanted, and says
+what it does not affect, because reactions are cosmetic: prompts and
 replies work without them. Messages rho does not accept — from a bot, from the
 wrong user, or with no text to read — get neither reaction nor typing.
 
@@ -226,7 +228,8 @@ frame it cannot read (JSON that does not parse, or a binary frame from a session
 it cannot decode), a reply Discord refuses (`401` bad token, `403` missing
 permissions, a `429` that outlasts the retries), reply chunks dropped because
 the outbox is full, an answer that had no text to post, a reaction Discord
-refused (the first one, which names *Add Reactions*), a typing ping Discord
+refused (the first one, which names *Add Reactions* and *Read Message
+History*), a typing ping Discord
 refused, and a message that never reached the agent. So a bridge that is
 connected but not delivering is loud, not silent.
 

@@ -214,9 +214,10 @@ loop:
   `401`) at 4 messages per 5 s, so chunk bursts stay under Discord's
   per-channel limit.
 - An accepted prompt is acknowledged on Discord itself: a 👀 reaction
-  (`POST /channels/{id}/messages/{id}/reactions/@me/%F0%9F%91%80`, unicode is
-  percent-encoded in the path) and a typing ping (`POST /channels/{id}/typing`)
-  refreshed every 8 s until the answer is handed to the outbox, since Discord
+  (`PUT /channels/{id}/messages/{id}/reactions/%F0%9F%91%80/@me`, unicode is
+  percent-encoded in the path, and a `POST` on that endpoint is a `405`) and a
+  typing ping (`POST /channels/{id}/typing`) refreshed every 8 s until the
+  answer is handed to the outbox, since Discord
   expires its own typing banner after about 10 s. Signals ride a bounded queue
   with their own rate limit, so a refused or slow reaction can never delay a
   reply, and the gateway read loop never waits on one. `TypingBoard` keeps one
@@ -225,8 +226,10 @@ loop:
   `Idle` with no answer before it drops the oldest episode (an interrupted turn
   owes no reply), a lagged or closed event stream clears them all, and an
   episode older than 5 min is abandoned with a note, so a lost stop cannot
-  pretend to type forever. Reactions need the *Add Reactions* permission; the
-  first refusal is reported as a fault naming it and the rest are only counted.
+  pretend to type forever. Reactions need the *Add Reactions* and *Read
+  Message History* permissions (in servers only; DMs need neither); the
+  first refusal is reported as a fault naming them and the rest are only
+  counted.
 - Silence is explained rather than guessed at, and the explanation is drawn in
   the rho window: the TUI owns the terminal, so every bridge note arrives as a
   transcript line (only headless runs, which have no TUI, write them to

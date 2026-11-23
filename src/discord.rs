@@ -539,7 +539,8 @@ impl Bridge {
         if first {
             self.fail(&format!(
                 "discord: could not add a reaction to {target}: {message}; reactions need the \
-                 Add Reactions permission, prompts and replies work without them"
+                 Add Reactions and Read Message History permissions, prompts and replies work \
+                 without them"
             ));
         }
     }
@@ -1214,7 +1215,7 @@ impl<P: Poster> SignalTask<P> {
         let now = tokio::time::Instant::now();
         self.board.pinged(channel_id, now);
         self.bucket.acquire().await;
-        if let Err((message, _)) = self.poster.post(&Call::typing(channel_id)).await {
+        if let Err((message, _)) = self.poster.send(&Call::typing(channel_id)).await {
             self.bridge
                 .note_typing_failure(&format!("#{channel_id}"), &message);
         } else {
@@ -1678,18 +1679,35 @@ pub struct Posted {
     pub text: String,
 }
 
-/// One Discord REST call. Answers, reactions and typing pings are all POSTs
-/// that differ only in endpoint and body, so they share the retry and
-/// rate-limit machinery.
+/// One Discord REST call. Answers, reactions and typing pings differ only in
+/// verb, endpoint and body, so they share the retry and rate-limit machinery.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
+    pub verb: Verb,
     pub url: String,
     pub body: Option<Value>,
+}
+
+/// Discord answers anything else with a `405`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Post,
+    Put,
+}
+
+impl Verb {
+    pub fn as_method(self) -> reqwest::Method {
+        match self {
+            Verb::Post => reqwest::Method::POST,
+            Verb::Put => reqwest::Method::PUT,
+        }
+    }
 }
 
 impl Call {
     pub fn message(channel_id: &str, text: &str) -> Self {
         Self {
+            verb: Verb::Post,
             url: send_url(channel_id),
             body: Some(json!({ "content": text })),
         }
@@ -1697,6 +1715,7 @@ impl Call {
 
     pub fn react(channel_id: &str, message_id: &str, emoji: &str) -> Self {
         Self {
+            verb: Verb::Put,
             url: reaction_url(channel_id, message_id, emoji),
             body: None,
         }
@@ -1704,6 +1723,7 @@ impl Call {
 
     pub fn typing(channel_id: &str) -> Self {
         Self {
+            verb: Verb::Post,
             url: typing_url(channel_id),
             body: None,
         }
@@ -1711,7 +1731,7 @@ impl Call {
 }
 
 trait Poster {
-    async fn post(&self, call: &Call) -> Result<(), (String, Retry)>;
+    async fn send(&self, call: &Call) -> Result<(), (String, Retry)>;
 }
 
 #[derive(Debug, PartialEq)]
@@ -1726,7 +1746,7 @@ async fn deliver<P: Poster + ?Sized>(post: &P, bucket: &mut Bucket, call: Call) 
     loop {
         bucket.acquire().await;
         attempts += 1;
-        match post.post(&call).await {
+        match post.send(&call).await {
             Ok(()) => return Delivery::Sent,
             Err((message, Retry::Stop)) => return Delivery::Failed(message),
             Err((message, Retry::Wait(wait))) => {
@@ -1791,9 +1811,10 @@ pub fn send_url(channel_id: &str) -> String {
     )
 }
 
+/// The emoji goes before the literal `@me`, not after it.
 pub fn reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
     format!(
-        "https://discord.com/api/v10/channels/{}/messages/{}/reactions/@me/{}",
+        "https://discord.com/api/v10/channels/{}/messages/{}/reactions/{}/@me",
         channel_id.trim(),
         message_id.trim(),
         encode_emoji(emoji)
@@ -1827,8 +1848,8 @@ pub fn auth_header(bot_token: &str) -> String {
 }
 
 impl Poster for RestPoster {
-    async fn post(&self, call: &Call) -> Result<(), (String, Retry)> {
-        let mut request = self.http.post(&call.url).header(
+    async fn send(&self, call: &Call) -> Result<(), (String, Retry)> {
+        let mut request = self.http.request(call.verb.as_method(), &call.url).header(
             reqwest::header::AUTHORIZATION,
             auth_header(&self.config.bot_token),
         );
@@ -2386,6 +2407,7 @@ mod tests {
         assert_eq!(retry_policy(500, None, None), Retry::Wait(RETRY_WAIT));
         assert_eq!(retry_policy(502, None, None), Retry::Wait(RETRY_WAIT));
         assert_eq!(retry_policy(403, Some("5"), None), Retry::Stop);
+        assert_eq!(retry_policy(405, None, None), Retry::Stop);
         assert_eq!(retry_policy(401, None, None), Retry::Stop);
         assert_eq!(retry_policy(200, None, None), Retry::Stop);
     }
@@ -2493,7 +2515,7 @@ mod tests {
     }
 
     impl Poster for ScriptedPoster {
-        async fn post(&self, _call: &Call) -> Result<(), (String, Retry)> {
+        async fn send(&self, _call: &Call) -> Result<(), (String, Retry)> {
             self.attempts.set(self.attempts.get() + 1);
             self.script
                 .borrow_mut()
@@ -2772,7 +2794,7 @@ mod tests {
         assert_eq!(encode_emoji("rho:1"), "rho%3A1");
         assert_eq!(
             reaction_url("9", "55", EYES),
-            "https://discord.com/api/v10/channels/9/messages/55/reactions/@me/%F0%9F%91%80"
+            "https://discord.com/api/v10/channels/9/messages/55/reactions/%F0%9F%91%80/@me"
         );
         assert_eq!(
             typing_url(" 9 "),
@@ -2781,15 +2803,24 @@ mod tests {
         assert_eq!(
             Call::typing("9"),
             Call {
+                verb: Verb::Post,
                 url: typing_url("9"),
                 body: None
             }
         );
         assert_eq!(
+            Call::react("9", "55", EYES),
+            Call {
+                verb: Verb::Put,
+                url: reaction_url("9", "55", EYES),
+                body: None
+            }
+        );
+        assert_eq!(Call::message("9", "hi").verb, Verb::Post);
+        assert_eq!(
             Call::message("9", "hi").body,
             Some(json!({ "content": "hi" }))
         );
-        assert_eq!(Call::react("9", "55", EYES).body, None);
     }
 
     #[test]
@@ -2912,18 +2943,22 @@ mod tests {
         fn url(&self, index: usize) -> String {
             self.calls.lock().unwrap()[index].url.clone()
         }
+
+        fn verb(&self, index: usize) -> Verb {
+            self.calls.lock().unwrap()[index].verb
+        }
     }
 
     impl Poster for RecordingPoster {
-        async fn post(&self, call: &Call) -> Result<(), (String, Retry)> {
+        async fn send(&self, call: &Call) -> Result<(), (String, Retry)> {
             self.calls.lock().unwrap().push(call.clone());
             Ok(())
         }
     }
 
     impl<P: Poster + ?Sized> Poster for Arc<P> {
-        async fn post(&self, call: &Call) -> Result<(), (String, Retry)> {
-            (**self).post(call).await
+        async fn send(&self, call: &Call) -> Result<(), (String, Retry)> {
+            (**self).send(call).await
         }
     }
 
@@ -2985,10 +3020,11 @@ mod tests {
         assert!(
             poster
                 .url(0)
-                .ends_with("messages/55/reactions/@me/%F0%9F%91%80"),
+                .ends_with("messages/55/reactions/%F0%9F%91%80/@me"),
             "{}",
             poster.url(0)
         );
+        assert_eq!(poster.verb(0), Verb::Put, "reactions are a PUT");
 
         tx.send(Signal::TypingStart {
             channel_id: "9".to_string(),
