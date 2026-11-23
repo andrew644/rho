@@ -128,18 +128,22 @@ async fn main() -> anyhow::Result<()> {
         event_tx.clone(),
         resumed.clone(),
     );
-    let bridge = if config.discord.enabled {
-        Some(rho::discord::spawn(
+    let (bridge, remote) = if config.discord.enabled {
+        let (bridge, commands) = rho::discord::spawn(
             config.clone(),
             agent_tx.clone(),
             event_tx.clone(),
             print_mode,
-        ))
+        );
+        (Some(bridge), Some(commands))
     } else {
-        None
+        (None, None)
     };
 
     if print_mode {
+        // Nothing is listening for Discord commands without a window to run
+        // them in, so closing the queue makes the bot say so where it was asked.
+        drop(remote);
         return run_print(agent_tx, event_rx.resubscribe(), prompt).await;
     }
 
@@ -163,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         session_path: resumed.as_ref().map(|p| p.display().to_string()),
         clipboard: config.clipboard,
         discord: bridge,
+        remote,
     };
     rho::tui::run(agent_tx, cancel, event_rx, tui).await
 }

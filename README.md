@@ -102,6 +102,12 @@ Commands are typed in the input with a `:` prefix.
 :stop  :help  :quit
 ```
 
+Everything in that list, and the `!`/`!!` shell escapes too, works when typed
+into Discord instead of the input: rho runs it exactly as if it had been typed
+at the keyboard and posts back to the channel the same text it puts in the
+transcript. `:quit` is the one exception — it only closes the window from the
+keyboard.
+
 Conversations are saved automatically as JSONL sessions under the state
 directory, grouped by working directory. Long conversations are compacted
 automatically when the context estimate nears `context_window`, or manually
@@ -175,6 +181,19 @@ it is empty anyone who can DM the bot or who shares a server with it can drive
 the agent, and rho warns about that at startup. Messages from bots are always
 ignored.
 
+Messages that read as commands — `:compact`, `:session`, `:model gpt-4`,
+`!cargo test`, `!!git status` — are not sent to the model. They go to the TUI,
+which runs them exactly as if they had been typed at the keyboard, and posts
+back to the channel the same lines it puts in the transcript: the shell output
+for `!`/`!!`, the model list for `:model`, the compaction note for `:compact`,
+the error line for a bad path or an unknown command. A command that arrives
+while the agent is busy waits its turn, so its reply cannot be confused with
+the turn already running, and a `:loop` posts each iteration as it finishes
+rather than saving everything up for an end that may never come. `:quit` is
+refused: the keyboard is the only place that closes the window. In headless
+`rho --print` there is no window to run commands in, and the bot says so in the
+channel it was asked in.
+
 Every prompt rho accepts puts a 👀 reaction on the message that asked for it,
 and the bot shows as typing in that channel until the answer is on its way
 back — refreshed every 8 s, because Discord lets its own typing banner expire
@@ -205,6 +224,9 @@ line, so if nothing appears at all, Discord never sent it:
 - `@alice in server "Work" #9: "build it" — queued as a prompt` — the message
   arrived and reached the agent's queue; `DM #7` is the same for direct
   messages.
+- `@alice in server "Work" #9: ":session" — queued as a command` — the message
+  read as a `:` command or a `!`/`!!` shell escape, so it went to the window
+  rather than to the model, and its output comes back to that channel.
 - `@alice in server "Work" #9: arrived with no text content, so nothing was
   queued` — the message reached rho with an empty `content`, so the *Message
   Content Intent* is not being applied.
@@ -238,11 +260,12 @@ connected but not delivering is loud, not silent.
 
 `:discord` prints the same picture on demand: connection state, the intents
 Discord granted, the servers the bot can see, how many messages arrived, how
-many were queued as prompts, how many reply chunks went out, the last inbound
-line, how many reactions and typing indicators went out and how many Discord
-refused, how many errors were reported and the last of them (its own lines turn
-red when they are reporting one). Messages from other bots are counted but only
-mentioned the first time, so a busy channel cannot push your transcript along.
+many were queued as prompts and how many as commands, how many reply chunks
+went out, the last inbound line, how many reactions and typing indicators went
+out and how many Discord refused, how many errors were reported and the last of
+them (its own lines turn red when they are reporting one). Messages from other
+bots are counted but only mentioned the first time, so a busy channel cannot
+push your transcript along.
 
 Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
 retried after the `Retry-After` Discord reports (up to 3 attempts); a full

@@ -204,7 +204,7 @@ loop:
   re-identify, anything else resumes. Wait between attempts doubles from 1 s
   to 60 s with jitter and resets once a session identifies.
 - Incoming `MESSAGE_CREATE` from the allowed user, in any DM or server channel
-  the bot can see (`channel_id` never filters inbound messages): text is
+  the bot can see (`channel_id` never filters inbound messages): prompt text is
   enqueued as an agent prompt and the channel becomes the reply target, so
   answers go back where the question was asked; the configured `channel_id` is
   the fallback for prompts with no Discord origin (TUI, `rho -p`). Agent
@@ -213,7 +213,20 @@ loop:
   `Authorization: Bot <token>` (Discord rejects `Bearer` for bot tokens with
   `401`) at 4 messages per 5 s, so chunk bursts stay under Discord's
   per-channel limit.
-- An accepted prompt is acknowledged on Discord itself: a 👀 reaction
+- Text that reads as a command (`:compact`, `:model gpt`, `!cargo test`,
+  `!!git status` — the same rule `classify_input` applies to the input) is not
+  a prompt: it goes over a queue to the TUI, which is what owns every command,
+  and runs there exactly as a keystroke would. The reply is the block of
+  transcript the command added, posted to the channel that asked (chunked at
+  2000 chars like an answer, and it stops the typing indicator), so Discord
+  reads the same words the window shows: shell output, model list, compaction
+  note, or the error line for a bad path or an unknown command. Reasoning is
+  left out. Commands that arrive while the agent is busy wait for it to go
+  idle, so a reply cannot be blamed on the wrong turn, and `:loop` posts each
+  iteration as it lands instead of waiting for an end that never comes for
+  `forever`. `:quit` is refused remotely, and with no TUI at all (`rho
+  --print`) the bot says the command could not run in the channel it came from.
+- An accepted message is acknowledged on Discord itself: a 👀 reaction
   (`PUT /channels/{id}/messages/{id}/reactions/%F0%9F%91%80/@me`, unicode is
   percent-encoded in the path, and a `POST` on that endpoint is a `405`) and a
   typing ping (`POST /channels/{id}/typing`) refreshed every 8 s until the
@@ -239,8 +252,8 @@ loop:
   `READY` reports the intents Discord granted and faults when it did not grant
   the privileged one, each `GUILD_CREATE` reports the server name/id and whether
   it is available, every `MESSAGE_CREATE` reports who sent it from where and
-  what rho did with it (queued, empty content, wrong author, bot, never
-  delivered to the agent), and the first allowed server message that arrives
+  what rho did with it (queued as a prompt, queued as a command, empty content,
+  wrong author, bot, never delivered to the agent), and the first allowed server message that arrives
   with empty `content`, the first author rejected by `allowed_user_id`, the
   first frame that does not parse and the first binary frame each add a
   one-line explanation — the ones that mean rho cannot do what it was asked are

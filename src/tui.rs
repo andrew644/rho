@@ -10,6 +10,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::Frame;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::agent::{AgentCommand, AgentEvent};
 use crate::clipboard::{Clipboard, ClipboardMode};
 use crate::config::ThemeName;
-use crate::discord::Bridge;
+use crate::discord::{Bridge, RemoteCommand};
 use crate::loops::parse_loop_spec;
 use crate::selection::{self, Anchor, Selection};
 use crate::session::{self, SessionInfo};
@@ -109,11 +110,48 @@ pub fn classify_input(input: &str, template_names: &[String]) -> Option<InputAct
     }
 }
 
+/// True when text typed into the input would be read as a command rather than
+/// as a prompt: a `:` command or a `!`/`!!` shell escape. The Discord bridge
+/// asks this before queueing a message, because commands belong to the window
+/// that draws the transcript, not to the model.
+pub fn is_command(input: &str) -> bool {
+    matches!(classify_input(input, &[]), Some(InputAction::Command(_)))
+}
+
 #[derive(Clone)]
 struct Entry {
     text: String,
     kind: Kind,
     output: Option<String>,
+}
+
+/// A command that came from Discord: every transcript line it adds is posted
+/// back to the channel that asked for it. `base` is where those lines start in
+/// `entries`, so the reply says exactly what the window showed.
+struct Capture {
+    channel: String,
+    request: String,
+    base: usize,
+}
+
+/// Commands whose output the agent writes rather than the window: their lines
+/// land after the command was handed over, so the reply waits for the agent to
+/// go idle instead of posting an empty answer.
+fn owes_agent_output(action: &Option<InputAction>) -> bool {
+    matches!(
+        action,
+        Some(InputAction::Command(
+            Command::Shell { .. }
+                | Command::Loop(_)
+                | Command::Compact(_)
+                | Command::New
+                | Command::Resume(_)
+                | Command::Name(_)
+                | Command::Model(_)
+                | Command::Pwd(_)
+                | Command::Template { .. }
+        ))
+    )
 }
 
 const TOOL_OUTPUT_LINES: usize = 20;
@@ -528,6 +566,9 @@ pub struct App {
     clipboard: Clipboard,
     notice: Option<(String, Instant)>,
     discord: Option<Arc<Bridge>>,
+    capture: Option<Capture>,
+    remote_queue: VecDeque<(String, String)>,
+    agent_touched: bool,
 }
 
 impl App {
@@ -593,6 +634,9 @@ impl App {
             clipboard: Clipboard::new(ClipboardMode::default()),
             notice: None,
             discord: None,
+            capture: None,
+            remote_queue: VecDeque::new(),
+            agent_touched: false,
         }
     }
 
@@ -799,6 +843,7 @@ impl App {
                         status.split(" iter ").next().unwrap_or("loop")
                     );
                 }
+                self.post_capture(true);
             }
             AgentEvent::LoopFinished { iterations, reason } => {
                 self.loop_status = None;
@@ -1297,6 +1342,19 @@ impl App {
                 format!("the agent is not running, so the request was dropped ({e})"),
                 Kind::Error,
             );
+            return;
+        }
+        self.agent_touched = true;
+    }
+
+    /// Empties the transcript for a session change, keeping a mirrored Discord
+    /// command pointed at whatever lines come next.
+    fn clear_transcript(&mut self) {
+        self.entries.clear();
+        self.pending = None;
+        self.clear_selection();
+        if let Some(capture) = &mut self.capture {
+            capture.base = 0;
         }
     }
 
@@ -1385,9 +1443,7 @@ impl App {
             }
             Some(InputAction::Command(Command::New)) => {
                 self.send_to_agent(agent, AgentCommand::NewSession);
-                self.entries.clear();
-                self.clear_selection();
-                self.pending = None;
+                self.clear_transcript();
                 self.push("new session started", Kind::Info);
             }
             Some(InputAction::Command(Command::Pwd(path))) => {
@@ -1406,8 +1462,7 @@ impl App {
                         Ok(n) if n >= 1 && n <= self.session_list.len() => {
                             let path = self.session_list[n - 1].path.clone();
                             self.send_to_agent(agent, AgentCommand::Resume { path });
-                            self.entries.clear();
-                            self.clear_selection();
+                            self.clear_transcript();
                             self.push(format!("resumed session {}", n), Kind::Info);
                         }
                         _ => self.push("usage: :resume to list, :resume <n> to open", Kind::Error),
@@ -1490,6 +1545,105 @@ impl App {
             None => {}
         }
         false
+    }
+
+    /// Runs a command that arrived from Discord. Commands are the window's own
+    /// business, so this is the same path a keystroke takes; what it adds to the
+    /// transcript is posted back to the channel that asked.
+    pub fn on_remote(
+        &mut self,
+        command: RemoteCommand,
+        agent: &mpsc::UnboundedSender<AgentCommand>,
+    ) {
+        if self.busy || self.capture.is_some() || !self.remote_queue.is_empty() {
+            self.remote_queue
+                .push_back((command.channel_id, command.text));
+            return;
+        }
+        self.run_remote(&command.channel_id, &command.text, agent);
+    }
+
+    /// The agent went idle: whatever the mirrored command was still waiting for
+    /// has landed, and the commands that queued behind it can run now that their
+    /// output cannot be mixed up with someone else's turn.
+    pub fn remote_idle(&mut self, agent: &mpsc::UnboundedSender<AgentCommand>) {
+        if self.capture.is_some() {
+            self.post_capture(false);
+        }
+        while let Some((channel, text)) = self.remote_queue.pop_front() {
+            self.run_remote(&channel, &text, agent);
+            if self.capture.is_some() {
+                break;
+            }
+        }
+    }
+
+    fn run_remote(
+        &mut self,
+        channel: &str,
+        text: &str,
+        agent: &mpsc::UnboundedSender<AgentCommand>,
+    ) {
+        let action = classify_input(text, &self.template_names());
+        self.agent_touched = false;
+        self.capture = Some(Capture {
+            channel: channel.to_string(),
+            request: text.to_string(),
+            base: self.entries.len(),
+        });
+        if matches!(action, Some(InputAction::Command(Command::Quit))) {
+            self.push(
+                "the keyboard is the only place :quit works, so the window stays open",
+                Kind::Error,
+            );
+        } else {
+            self.on_submit(text, agent);
+        }
+        if !(owes_agent_output(&action) && self.agent_touched) {
+            self.post_capture(false);
+        }
+    }
+
+    /// Posts the transcript lines a mirrored command has produced. `keep_open`
+    /// leaves the mirror running, which is how a loop reports each iteration as
+    /// it lands instead of saving everything up for an end that may never come.
+    fn post_capture(&mut self, keep_open: bool) {
+        self.flush_pending();
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let mut lines: Vec<String> = Vec::new();
+        for entry in self
+            .entries
+            .iter()
+            .skip(capture.base.min(self.entries.len()))
+        {
+            if entry.kind == Kind::Reasoning {
+                continue;
+            }
+            let body = match &entry.output {
+                Some(output) => format!("{}\n{}", entry.text.trim_end(), output.trim_end()),
+                None => entry.text.trim_end().to_string(),
+            };
+            if !body.trim().is_empty() {
+                lines.push(body);
+            }
+        }
+        capture.base = self.entries.len();
+        let body = if lines.is_empty() {
+            if keep_open {
+                return;
+            }
+            format!("{} produced no output", capture.request)
+        } else {
+            lines.join("\n\n")
+        };
+        if let Some(bridge) = self.discord.clone() {
+            bridge.post_reply(&capture.channel, &body);
+        }
+        if !keep_open {
+            self.capture = None;
+        }
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -1641,6 +1795,7 @@ pub struct TuiOptions {
     pub session_path: Option<String>,
     pub clipboard: ClipboardMode,
     pub discord: Option<Arc<Bridge>>,
+    pub remote: Option<mpsc::UnboundedReceiver<RemoteCommand>>,
 }
 
 async fn run_inner(
@@ -1661,6 +1816,7 @@ async fn run_inner(
     );
     app.clipboard = Clipboard::new(opts.clipboard);
     app.discord = opts.discord;
+    let mut remote = opts.remote;
     let mut keys = crossterm::event::EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
     loop {
@@ -1668,9 +1824,25 @@ async fn run_inner(
         tokio::select! {
             maybe_event = events.recv() => {
                 match maybe_event {
-                    Ok(event) => app.on_event(event),
+                    Ok(event) => {
+                        let idle = matches!(event, AgentEvent::Idle);
+                        app.on_event(event);
+                        if idle {
+                            app.remote_idle(&agent);
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            maybe_command = async {
+                match remote.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<RemoteCommand>>().await,
+                }
+            } => {
+                if let Some(command) = maybe_command {
+                    app.on_remote(command, &agent);
                 }
             }
             maybe_key = keys.next() => {
@@ -2563,6 +2735,192 @@ mod draw_tests {
             app.handle_key(key(KeyCode::Char(c)), &tx, &cancel);
         }
         assert!(app.handle_key(key(KeyCode::Enter), &tx, &cancel));
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    use crate::config::DiscordConfig;
+    use crate::discord::{Posted, Signal, Signals};
+
+    /// An app wired to a bridge whose outbox and courtesy queue the test reads.
+    fn remote_app() -> (App, mpsc::Receiver<Posted>, mpsc::Receiver<Signal>) {
+        let (events, _notes) = broadcast::channel(8);
+        let config = DiscordConfig {
+            enabled: true,
+            bot_token: "tok".to_string(),
+            channel_id: String::new(),
+            allowed_user_id: "42".to_string(),
+        };
+        let bridge = Arc::new(Bridge::new(&config, events, false));
+        let (outbox, answers) = mpsc::channel(8);
+        let (signals, courtesies) = mpsc::channel(32);
+        bridge.attach_delivery(outbox, Signals::new(signals, bridge.clone()));
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "test-model".into(),
+            vec!["test-model".into()],
+            vec![],
+            128_000,
+            Theme::new(ThemeName::Dark),
+            None,
+        );
+        app.discord = Some(bridge);
+        (app, answers, courtesies)
+    }
+
+    fn command(text: &str) -> RemoteCommand {
+        RemoteCommand {
+            channel_id: "9".to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn command_text_is_recognised_without_a_template_list() {
+        assert!(is_command(":compact"));
+        assert!(is_command(":review"));
+        assert!(is_command("!ls -la"));
+        assert!(is_command("!!git status"));
+        assert!(!is_command("build it"));
+        assert!(!is_command("fix !this please"));
+    }
+
+    #[test]
+    fn a_remote_command_posts_what_the_transcript_shows() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.on_remote(command(":help"), &tx);
+
+        let said = answers.try_recv().unwrap();
+        assert_eq!(said.channel_id, "9");
+        assert!(said.text.contains(":compact"), "{}", said.text);
+        assert!(
+            said.text.contains("!!cmd runs it without sharing"),
+            "{}",
+            said.text
+        );
+    }
+
+    #[test]
+    fn a_remote_shell_command_waits_for_its_output() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.on_remote(command("!ls"), &tx);
+        assert!(answers.try_recv().is_err());
+
+        app.on_event(AgentEvent::ToolStarted {
+            name: "bash".into(),
+            args: "ls".into(),
+        });
+        app.on_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            is_error: false,
+            output: "file.txt\n".into(),
+        });
+        assert!(answers.try_recv().is_err(), "the agent is still working");
+
+        app.remote_idle(&tx);
+
+        let said = answers.try_recv().unwrap();
+        assert!(said.text.contains("! ls"), "{}", said.text);
+        assert!(said.text.contains("bash ls ✓"), "{}", said.text);
+        assert!(said.text.contains("file.txt"), "{}", said.text);
+    }
+
+    #[test]
+    fn a_command_sent_while_rho_is_busy_waits_its_turn() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.busy = true;
+
+        app.on_remote(command(":session"), &tx);
+        assert!(answers.try_recv().is_err());
+
+        app.remote_idle(&tx);
+
+        let said = answers.try_recv().unwrap();
+        assert!(said.text.contains("session (unnamed)"), "{}", said.text);
+    }
+
+    #[test]
+    fn a_loop_reports_each_iteration_as_it_lands() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.on_remote(command(":loop 2 build it"), &tx);
+        assert!(answers.try_recv().is_err());
+
+        app.on_event(AgentEvent::LoopStarted {
+            description: "2 times".into(),
+        });
+        app.on_event(AgentEvent::LoopIterationDone { iterations: 1 });
+        let said = answers.try_recv().unwrap();
+        assert!(
+            said.text.contains("loop started [2 times]"),
+            "{}",
+            said.text
+        );
+        assert!(
+            answers.try_recv().is_err(),
+            "nothing new since the last post"
+        );
+
+        app.on_event(AgentEvent::LoopFinished {
+            iterations: 2,
+            reason: "count reached".into(),
+        });
+        app.remote_idle(&tx);
+        let said = answers.try_recv().unwrap();
+        assert!(
+            said.text
+                .contains("loop finished: count reached after 2 iteration(s)"),
+            "{}",
+            said.text
+        );
+    }
+
+    #[test]
+    fn reasoning_is_left_out_of_the_reply() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.on_remote(command(":compact"), &tx);
+        app.on_event(AgentEvent::ReasoningDelta("thinking hard".into()));
+        app.on_event(AgentEvent::Info("compacted 4 messages".into()));
+        app.remote_idle(&tx);
+
+        let said = answers.try_recv().unwrap();
+        assert!(said.text.contains("compacted 4 messages"), "{}", said.text);
+        assert!(!said.text.contains("thinking hard"), "{}", said.text);
+    }
+
+    #[test]
+    fn a_command_that_produced_nothing_says_so() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.on_remote(command(":name rho"), &tx);
+        app.remote_idle(&tx);
+
+        let said = answers.try_recv().unwrap();
+        assert!(said.text.contains(":name rho"), "{}", said.text);
+        assert!(said.text.contains("produced no output"), "{}", said.text);
+    }
+
+    #[test]
+    fn quit_from_discord_leaves_the_window_open() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.on_remote(command(":quit"), &tx);
+
+        assert!(!app.should_quit());
+        let said = answers.try_recv().unwrap();
+        assert!(said.text.contains("keyboard"), "{}", said.text);
     }
 }
 

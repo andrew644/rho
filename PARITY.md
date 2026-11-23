@@ -44,7 +44,7 @@ Pi columns below keep pi's spelling (`/compact` is rho's `:compact`).
 | Compaction: `/compact [instructions]` + auto-compaction near the context limit | `compaction` module; rho's command is `:compact`; token estimate ≈ chars/4; reserve/keep-recent thresholds configurable; summary replaces old prefix, recent messages kept; conversation serialized for summarization with 2000-char tool results; cut points at user and assistant messages |
 | Overflow / truncated-length recovery: one compact-and-retry attempt, session stays usable | `agent` + `client`: `ApiError::is_context_overflow` pattern matching, history sanitizer, synthetic results for truncated tool calls |
 | Prompt templates (markdown files → `/name` commands with `$1`, `$@`, `${1:-def}` substitutions) | `templates` module; rho invokes them as `:name`; loaded from `~/.config/rho/prompts/*.md` and `<cwd>/.rho/prompts/*.md` |
-| `!` / `!!` shell escapes (run a command, optionally feed output to the model) | TUI `!<cmd>` runs and appends output to conversation; `!!<cmd>` runs without sending to the model |
+| `!` / `!!` shell escapes (run a command, optionally feed output to the model) | TUI `!<cmd>` runs and appends output to conversation; `!!<cmd>` runs without sending to the model; both also work typed into Discord, which gets the output posted back |
 | Print mode (`pi --print "…"`, piped stdin, `@file` inclusion, initial prompts) | `rho --print [--continue] [--model id] [@file…] <prompt…>`; final answer to stdout, exit non-zero on error |
 | `/model` model selection | `model.models` list in config; `:model` lists, `:model <id>` switches; CLI `--model` override |
 | Multi-line editor (Shift+Enter), tool-output expand (Ctrl+O), thinking toggle (Ctrl+R in rho) | Shift+Enter/Ctrl+J insert newlines (bracketed paste inserts verbatim); Ctrl+O expands capped tool output; Ctrl+R shows/hides reasoning |
@@ -77,7 +77,7 @@ are **not** parity gaps for rho's purposes:
 | Feature | Notes |
 |---|---|
 | `:loop` (forever / N times / duration / until-condition) | Not shipped by pi ("Pi… skips features like sub-agents and plan mode") |
-| Discord remote-control bridge | Gateway websocket + REST relay sharing the serial prompt queue |
+| Discord remote-control bridge | Gateway websocket + REST relay sharing the serial prompt queue; `:` commands and `!`/`!!` shell escapes typed into Discord run in the TUI and post its transcript text back |
 | In-transcript selection with clipboard copy | rho captures the mouse (wheel scroll), so it draws its own selection: drag / double-click word / triple-click row, Ctrl+Y to copy again, OSC 52 with `wl-copy`/`xclip`/`xsel`/`pbcopy` fallback, `clipboard:` config |
 
 ## Step 13 exit criteria
