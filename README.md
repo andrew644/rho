@@ -67,6 +67,11 @@ cargo run
 - `!cmd` runs a shell command and shares its output with the model;
   `!!cmd` runs it without sharing. `/pwd <path>` changes the working
   directory for tools, agent requests, and `!`/`!!` commands.
+- Anything that is broken but survivable — a session file that cannot be
+  created, so the conversation stops being saved — is drawn as an error line in
+  the transcript (`! session persistence disabled: …`) rather than written to
+  the stderr the TUI repaints. `rho -p` prints the same thing to stderr as a
+  warning and still answers.
 
 ### Clipboard
 
@@ -88,7 +93,7 @@ handling).
 /new                                        start a new session
 /resume [n]                                 list recent sessions / open one
 /session                                    session file, id, message/token counts
-/discord                                    bridge status: connection, intents, servers, last message in/out
+/discord                                    bridge status: connection, intents, servers, counters, errors
 /name <text>                                name the current session
 /model [id]                                 list models / switch
 /pwd [path]                                 show / change the working directory
@@ -197,25 +202,42 @@ line, so if nothing appears at all, Discord never sent it:
 - `discord: server "Name" (id) available` — one line per server the bot is in
   and can read; a missing server means the bot was never invited there or
   lacks *View Channel*.
+- `@alice in server "Work" #9: not queued — the agent is not accepting prompts
+  (channel closed)` — the message reached the gateway but never reached the
+  agent, so no answer was ever coming.
+
+Anything the bridge *fails* to do is drawn as an error line (`! `, in red)
+rather than as a note (`· `): a gateway that closes, stops or loses the Message
+Content Intent, the first server message that arrives with no text to read, a
+frame it cannot read (JSON that does not parse, or a binary frame from a session
+it cannot decode), a reply Discord refuses (`401` bad token, `403` missing
+permissions, a `429` that outlasts the retries), reply chunks dropped because
+the outbox is full, an answer that had no text to post, and a message that
+never reached the agent. So a bridge that is connected but not delivering is
+loud, not silent.
 
 `/discord` prints the same picture on demand: connection state, the intents
 Discord granted, the servers the bot can see, how many messages arrived, how
 many were queued as prompts, how many reply chunks went out, the last inbound
-line and the last send error. Messages from other bots are counted but only
+line, how many errors were reported and the last of them (its own lines turn
+red when they are reporting one). Messages from other bots are counted but only
 mentioned the first time, so a busy channel cannot push your transcript along.
 
 Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
 retried after the `Retry-After` Discord reports (up to 3 attempts); a full
-outbox drops the newest chunks instead of blocking the agent. Dropped
-gateway connections resume with `op 6` using the saved `session_id`/`seq` when
-possible, otherwise they re-identify, and reconnect waits back off from 1 s to
-60 s. Authentication failures (`4004`, `4014`) stop the bridge instead of
-retrying; progress and failures are reported the same way as inbound traffic.
+outbox drops the newest chunks instead of blocking the agent, and names the
+ones it dropped. Dropped gateway connections resume with `op 6` using the saved
+`session_id`/`seq` when possible, otherwise they re-identify, and reconnect
+waits back off from 1 s to 60 s. Authentication failures (`4004`, `4014`) stop
+the bridge instead of retrying; progress and failures are reported the same way
+as inbound traffic.
 
 Replies are posted with `Authorization: Bot <token>`, so `discord.bot_token`
 must hold the bot token from the developer portal (not an OAuth2 access
 token); a `401` means the token is missing or wrong, a `403` means the bot
-lacks permission in that channel.
+lacks permission in that channel. Both arrive in the transcript as an error
+line naming the channel that refused the reply, and `/discord` keeps the last
+one.
 
 ## Tests
 

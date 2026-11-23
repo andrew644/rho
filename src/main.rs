@@ -196,6 +196,7 @@ async fn run_print(
                 code = 1;
                 break;
             }
+            Ok(AgentEvent::Fault(message)) => eprintln!("warning: {message}"),
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {

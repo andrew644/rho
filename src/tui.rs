@@ -815,6 +815,9 @@ impl App {
             AgentEvent::Info(message) => {
                 self.push(message, Kind::Info);
             }
+            AgentEvent::Fault(message) => {
+                self.push(message, Kind::Error);
+            }
             AgentEvent::ContextUsage {
                 est_tokens,
                 message_count,
@@ -1281,6 +1284,22 @@ impl App {
         ])
     }
 
+    /// Hands a command to the agent, saying so in the transcript if the agent
+    /// is gone: a dropped prompt would otherwise look like a request that was
+    /// simply never answered.
+    fn send_to_agent(
+        &mut self,
+        agent: &mpsc::UnboundedSender<AgentCommand>,
+        command: AgentCommand,
+    ) {
+        if let Err(e) = agent.send(command) {
+            self.push(
+                format!("the agent is not running, so the request was dropped ({e})"),
+                Kind::Error,
+            );
+        }
+    }
+
     fn submit_prompt(
         &mut self,
         display: &str,
@@ -1293,7 +1312,7 @@ impl App {
         self.push(display.to_string(), Kind::User);
         self.busy = true;
         self.status = "thinking".to_string();
-        let _ = agent.send(AgentCommand::Prompt { text });
+        self.send_to_agent(agent, AgentCommand::Prompt { text });
     }
 
     fn show_help(&mut self) {
@@ -1342,7 +1361,7 @@ impl App {
             }
             Some(InputAction::Command(Command::Quit)) => return true,
             Some(InputAction::Command(Command::Stop)) => {
-                let _ = agent.send(AgentCommand::Interrupt);
+                self.send_to_agent(agent, AgentCommand::Interrupt);
                 self.push("interrupt requested", Kind::Info);
             }
             Some(InputAction::Command(Command::Loop(args))) => match parse_loop_spec(&args) {
@@ -1350,7 +1369,7 @@ impl App {
                     self.history.push(format!("/loop {args}"));
                     self.busy = true;
                     self.status = "looping".to_string();
-                    let _ = agent.send(AgentCommand::Loop { spec });
+                    self.send_to_agent(agent, AgentCommand::Loop { spec });
                 }
                 Err(e) => self.push(e, Kind::Error),
             },
@@ -1362,10 +1381,10 @@ impl App {
                 });
                 self.busy = true;
                 self.status = "compacting".to_string();
-                let _ = agent.send(AgentCommand::Compact { instructions });
+                self.send_to_agent(agent, AgentCommand::Compact { instructions });
             }
             Some(InputAction::Command(Command::New)) => {
-                let _ = agent.send(AgentCommand::NewSession);
+                self.send_to_agent(agent, AgentCommand::NewSession);
                 self.entries.clear();
                 self.clear_selection();
                 self.pending = None;
@@ -1376,9 +1395,7 @@ impl App {
                     self.push(format!("pwd: {}", self.pwd.display()), Kind::Info);
                 } else {
                     self.history.push(format!("/pwd {path}"));
-                    let _ = agent.send(AgentCommand::SetPwd {
-                        path: PathBuf::from(path),
-                    });
+                    self.send_to_agent(agent, AgentCommand::SetPwd { path: PathBuf::from(path) });
                 }
             }
             Some(InputAction::Command(Command::Resume(args))) => {
@@ -1388,7 +1405,7 @@ impl App {
                     match args.parse::<usize>() {
                         Ok(n) if n >= 1 && n <= self.session_list.len() => {
                             let path = self.session_list[n - 1].path.clone();
-                            let _ = agent.send(AgentCommand::Resume { path });
+                            self.send_to_agent(agent, AgentCommand::Resume { path });
                             self.entries.clear();
                             self.clear_selection();
                             self.push(format!("resumed session {}", n), Kind::Info);
@@ -1410,8 +1427,9 @@ impl App {
             }
             Some(InputAction::Command(Command::Discord)) => match &self.discord {
                 Some(bridge) => {
-                    for line in bridge.summary().lines() {
-                        self.push(line, Kind::Info);
+                    for line in bridge.report() {
+                        let kind = if line.fault { Kind::Error } else { Kind::Info };
+                        self.push(line.text, kind);
                     }
                 }
                 None => self.push(
@@ -1420,7 +1438,7 @@ impl App {
                 ),
             },
             Some(InputAction::Command(Command::Name(name))) => {
-                let _ = agent.send(AgentCommand::SetName { name: name.clone() });
+                self.send_to_agent(agent, AgentCommand::SetName { name: name.clone() });
                 self.session_name = if name.is_empty() { None } else { Some(name) };
             }
             Some(InputAction::Command(Command::Model(arg))) => {
@@ -1435,7 +1453,7 @@ impl App {
                     );
                 } else if self.known_models.iter().any(|m| m == &arg) {
                     self.model = arg.clone();
-                    let _ = agent.send(AgentCommand::SetModel { id: arg });
+                    self.send_to_agent(agent, AgentCommand::SetModel { id: arg });
                 } else {
                     self.push(
                         format!(
@@ -1464,7 +1482,7 @@ impl App {
                 self.history.push(command.clone());
                 let prefix = if to_model { "!" } else { "!!" };
                 self.push(format!("{prefix} {command}"), Kind::User);
-                let _ = agent.send(AgentCommand::Shell { command, to_model });
+                self.send_to_agent(agent, AgentCommand::Shell { command, to_model });
             }
             Some(InputAction::Command(Command::Unknown(name))) => {
                 self.push(format!("unknown command: /{name}"), Kind::Error);
@@ -2402,6 +2420,73 @@ mod draw_tests {
         assert!(text.contains("connecting to the gateway"), "{text}");
         assert!(text.contains("allowed_user_id: 42"), "{text}");
         assert!(text.contains("fallback channel: chan"), "{text}");
+    }
+
+    #[test]
+    fn a_request_the_agent_cannot_take_says_so_in_the_transcript() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let mut app = test_app();
+
+        app.submit_prompt("build it", "build it".to_string(), &tx);
+
+        assert!(app.entries.iter().any(|e| e.kind == Kind::User));
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| e.kind == Kind::Error && e.text.contains("not running")),
+            "{:?}",
+            app.entries
+                .iter()
+                .map(|e| e.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn notes_and_faults_keep_their_kind_in_the_transcript() {
+        let mut app = test_app();
+        app.on_event(AgentEvent::Info(
+            "discord: answering #9 with 1 chunk".to_string(),
+        ));
+        app.on_event(AgentEvent::Fault(
+            "discord: could not post a reply: #9: discord REST 403: Missing Permissions"
+                .to_string(),
+        ));
+        assert!(app
+            .entries
+            .iter()
+            .any(|e| e.kind == Kind::Info && e.text.contains("answering #9")));
+        assert!(app
+            .entries
+            .iter()
+            .any(|e| e.kind == Kind::Error && e.text.contains("403")));
+    }
+
+    #[test]
+    fn discord_report_draws_the_lines_that_report_failures_as_errors() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _keep) = broadcast::channel(8);
+        let config = DiscordConfig {
+            enabled: true,
+            bot_token: "tok".to_string(),
+            channel_id: "chan".to_string(),
+            allowed_user_id: String::new(),
+        };
+        let bridge = Arc::new(Bridge::new(&config, events, false));
+        bridge.fail("discord: could not post a reply: #9: discord REST 401: Unauthorized");
+
+        let mut app = test_app();
+        app.discord = Some(bridge);
+        app.on_submit("/discord", &tx);
+
+        let errors: Vec<&str> = app
+            .entries
+            .iter()
+            .filter(|e| e.kind == Kind::Error)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(errors.iter().any(|t| t.contains("401")), "{errors:?}");
     }
 
     #[test]

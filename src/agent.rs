@@ -59,6 +59,12 @@ pub enum AgentEvent {
         reason: String,
     },
     Info(String),
+    /// Something is broken but the agent keeps running: a session that is no
+    /// longer being saved, a Discord reply that was refused. Distinct from
+    /// `Error`, which means this prompt produced no answer — the print runner
+    /// gives up on `Error`, the Discord reply relay answers with its text, and
+    /// neither is right for a failure the agent has already worked around.
+    Fault(String),
     ContextUsage {
         est_tokens: usize,
         message_count: usize,
@@ -155,7 +161,9 @@ impl Agent {
             session_header,
         };
         if agent.session_path.is_none() {
-            agent.new_session_file();
+            if let Err(e) = agent.new_session_file() {
+                let _ = events.send(AgentEvent::Fault(e));
+            }
         }
         agent.persist(&events);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
@@ -184,7 +192,9 @@ impl Agent {
                     }
                     AgentCommand::NewSession => {
                         agent.history = vec![Message::system(build_system_prompt(&agent.pwd))];
-                        agent.new_session_file();
+                        if let Err(e) = agent.new_session_file() {
+                            let _ = events.send(AgentEvent::Fault(e));
+                        }
                     }
                     AgentCommand::Resume { path } => match session::load_session(&path) {
                         Ok((header, messages)) => {
@@ -269,17 +279,21 @@ impl Agent {
             .unwrap_or_else(|| "(unnamed)".to_string())
     }
 
-    fn new_session_file(&mut self) {
+    /// Opens the file this session is written to. A failure comes back as a
+    /// message for the transcript instead of stderr, which the TUI paints over:
+    /// a session that silently stops being saved is otherwise lost unnoticed.
+    fn new_session_file(&mut self) -> Result<(), String> {
         let header = SessionHeader::new(&self.pwd, &self.model);
         match session::create_session_file(&self.pwd, &header) {
             Ok(path) => {
                 self.session_header = Some(header);
                 self.session_path = Some(path);
+                Ok(())
             }
             Err(e) => {
                 self.session_header = None;
                 self.session_path = None;
-                eprintln!("session persistence disabled: {e}");
+                Err(format!("session persistence disabled: {e}"))
             }
         }
     }
@@ -708,6 +722,21 @@ mod tests {
         (agent, dir)
     }
 
+    fn with_state_home<T>(home: &Path, run: impl FnOnce() -> T) -> T {
+        static STATE_HOME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = STATE_HOME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", home);
+        let value = run();
+        match previous {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        value
+    }
+
     fn recv_usage(rx: &mut broadcast::Receiver<AgentEvent>) -> (usize, usize) {
         match rx.try_recv().unwrap() {
             AgentEvent::ContextUsage {
@@ -750,6 +779,33 @@ mod tests {
             }
         }
         assert!(usage.is_some_and(|est| est > before));
+    }
+
+    #[test]
+    fn a_session_file_that_cannot_be_written_says_persistence_is_off() {
+        let blocker = tempfile::tempdir().unwrap();
+        let file = blocker.path().join("blocked");
+        std::fs::write(&file, "").unwrap();
+        let (mut agent, _dir) = test_agent();
+
+        let error = with_state_home(&file, || agent.new_session_file()).unwrap_err();
+
+        assert!(error.contains("session persistence disabled"), "{error}");
+        assert!(agent.session_path.is_none());
+        assert!(agent.session_header.is_none());
+    }
+
+    #[test]
+    fn a_session_file_that_can_be_written_leaves_no_error() {
+        let state = tempfile::tempdir().unwrap();
+        let (mut agent, _dir) = test_agent();
+
+        with_state_home(state.path(), || agent.new_session_file()).unwrap();
+
+        let path = agent.session_path.clone().unwrap();
+        assert!(path.exists());
+        assert!(path.starts_with(state.path()));
+        assert!(agent.session_header.is_some());
     }
 
     #[test]

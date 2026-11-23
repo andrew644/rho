@@ -42,6 +42,9 @@ pub enum Ignore {
     FromBot,
     DisallowedUser(String),
     NoText,
+    /// The message was accepted but never reached the agent, so no answer will
+    /// ever come for it.
+    NotDelivered(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +86,8 @@ pub fn is_guild_message(d: &Value) -> bool {
 pub struct Notices {
     missing_text: bool,
     disallowed_user: bool,
+    unreadable_frame: bool,
+    binary_frame: bool,
 }
 
 impl Notices {
@@ -106,6 +111,26 @@ impl Notices {
             }
             _ => None,
         }
+    }
+
+    /// A frame the bridge could not read at all. Nothing else says why a
+    /// connected gateway appears to deliver nothing, so it is said once here.
+    pub fn unreadable_frame(&mut self) -> Option<String> {
+        (!self.unreadable_frame).then(|| {
+            self.unreadable_frame = true;
+            "discord: a gateway frame was not valid JSON, so it was skipped; if every frame is \
+             like this the gateway is not speaking encoding=json"
+                .to_string()
+        })
+    }
+
+    pub fn binary_frame(&mut self) -> Option<String> {
+        (!self.binary_frame).then(|| {
+            self.binary_frame = true;
+            "discord: the gateway sent a binary frame, which rho does not read; it only speaks \
+             JSON, so a compressed or payload-encoded session delivers no messages"
+                .to_string()
+        })
     }
 }
 
@@ -142,6 +167,9 @@ pub fn arrival(d: &Value, inbound: &Inbound, server: Option<&str>) -> String {
         }
         Inbound::Ignored(Ignore::NoText) => {
             format!("{who}: arrived with no text content, so nothing was queued")
+        }
+        Inbound::Ignored(Ignore::NotDelivered(reason)) => {
+            format!("{who}: not queued — {reason}")
         }
     }
 }
@@ -180,11 +208,31 @@ impl Server {
     }
 }
 
+/// One line of the `/discord` report. `fault` says the line is reporting
+/// something broken, so the transcript draws it as an error instead of as
+/// routine news.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusLine {
+    pub text: String,
+    pub fault: bool,
+}
+
+impl StatusLine {
+    fn note(text: String) -> Self {
+        Self { text, fault: false }
+    }
+
+    fn fault(text: String) -> Self {
+        Self { text, fault: true }
+    }
+}
+
 /// What the bridge knows about the live connection. The TUI shows it through
 /// `/discord` because stderr is invisible while the transcript owns the screen.
 #[derive(Debug, Default)]
 pub struct Status {
     pub state: String,
+    pub state_fault: bool,
     pub granted_intents: Option<u64>,
     pub message_content_granted: bool,
     pub servers: Vec<Server>,
@@ -193,7 +241,8 @@ pub struct Status {
     pub prompts_queued: usize,
     pub replies_posted: usize,
     pub last_inbound: Option<String>,
-    pub last_outbound_error: Option<String>,
+    pub errors: usize,
+    pub last_error: Option<String>,
 }
 
 impl Status {
@@ -212,6 +261,14 @@ impl Status {
     }
 
     pub fn summary(&self, allowed_user_id: &str, fallback_channel: &str) -> String {
+        self.lines(allowed_user_id, fallback_channel)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn lines(&self, allowed_user_id: &str, fallback_channel: &str) -> Vec<StatusLine> {
         let state = if self.state.is_empty() {
             "connecting to the gateway".to_string()
         } else {
@@ -248,35 +305,48 @@ impl Status {
             }
             None => "intents not reported yet".to_string(),
         };
-        [
-            format!("discord: {state}"),
-            format!("discord: {intents}"),
-            format!("discord: {servers}"),
-            format!(
-                "discord: {} message(s) in ({} from bots), {} queued as prompts, {} reply chunk(s) sent",
-                self.messages_seen,
-                self.bot_messages_seen,
-                self.prompts_queued,
-                self.replies_posted
+        let intents_missing = self.granted_intents.is_some() && !self.message_content_granted;
+        let errors = if self.errors > 0 {
+            StatusLine::fault(format!(
+                "discord: {} error(s) reported, last error: {}",
+                self.errors,
+                self.last_error
+                    .as_deref()
+                    .map(|error| error.trim_start_matches("discord: "))
+                    .unwrap_or("none")
+            ))
+        } else {
+            StatusLine::note("discord: no errors reported".to_string())
+        };
+        let line = |text: String, fault: bool| StatusLine { text, fault };
+        vec![
+            line(format!("discord: {state}"), self.state_fault),
+            line(format!("discord: {intents}"), intents_missing),
+            line(format!("discord: {servers}"), false),
+            line(
+                format!(
+                    "discord: {} message(s) in ({} from bots), {} queued as prompts, {} reply chunk(s) sent",
+                    self.messages_seen, self.bot_messages_seen, self.prompts_queued, self.replies_posted
+                ),
+                false,
             ),
-            format!(
-                "discord: last message in: {}",
-                self.last_inbound.as_deref().unwrap_or("none")
+            line(
+                format!(
+                    "discord: last message in: {}",
+                    self.last_inbound.as_deref().unwrap_or("none")
+                ),
+                false,
             ),
-            format!(
-                "discord: last send error: {}",
-                self.last_outbound_error.as_deref().unwrap_or("none")
-            ),
-            format!("discord: {allowed}"),
-            format!("discord: {fallback}"),
+            errors,
+            line(format!("discord: {allowed}"), false),
+            line(format!("discord: {fallback}"), false),
         ]
-        .join("\n")
     }
 }
 
 /// The bridge's voice. A TUI owns the terminal, so its notes go into the
-/// transcript as `Info` events; only headless runs (no TUI drawing over stderr)
-/// write them to the console.
+/// transcript as `Info`/`Fault` events; only headless runs (no TUI drawing over
+/// stderr) write them to the console.
 pub struct Bridge {
     events: broadcast::Sender<AgentEvent>,
     console: bool,
@@ -309,28 +379,57 @@ impl Bridge {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn note(&self, message: &str) {
+    fn emit(&self, fault: bool, message: &str) {
         if self.console {
             eprintln!("{message}");
-        } else {
-            let _ = self.events.send(AgentEvent::Info(message.to_string()));
+            return;
         }
+        let event = if fault {
+            AgentEvent::Fault(message.to_string())
+        } else {
+            AgentEvent::Info(message.to_string())
+        };
+        let _ = self.events.send(event);
     }
 
-    pub fn set_state(&self, state: &str) {
-        self.lock().state = state.to_string();
+    pub fn note(&self, message: &str) {
+        self.emit(false, message);
+    }
+
+    /// Reports a failure the bridge hit: it lands in the transcript as an error
+    /// line and is remembered for `/discord`, so a bridge that cannot deliver is
+    /// never silent.
+    pub fn fail(&self, message: &str) {
+        {
+            let mut status = self.lock();
+            status.errors += 1;
+            status.last_error = Some(message.to_string());
+        }
+        self.emit(true, message);
+    }
+
+    pub fn set_state(&self, state: &str, fault: bool) {
+        let mut status = self.lock();
+        status.state = state.to_string();
+        status.state_fault = fault;
     }
 
     pub fn note_ready(&self, ready: &ReadyInfo) {
         {
             let mut status = self.lock();
             status.state = ready.summary();
+            status.state_fault = ready.content_missing();
             status.granted_intents = ready.granted_intents;
             status.message_content_granted = ready
                 .granted_intents
                 .is_some_and(|granted| granted & GUILD_MESSAGE_CONTENT != 0);
         }
-        self.note(&format!("discord gateway {}", ready.summary()));
+        let line = format!("discord gateway {}", ready.summary());
+        if ready.content_missing() {
+            self.fail(&line);
+        } else {
+            self.note(&line);
+        }
     }
 
     pub fn note_server(&self, d: &Value) {
@@ -354,6 +453,7 @@ impl Bridge {
     /// push the transcript along.
     pub fn note_inbound(&self, d: &Value, inbound: &Inbound) {
         let line = arrival(d, inbound, self.server_of(d).as_deref());
+        let fault = matches!(inbound, Inbound::Ignored(Ignore::NotDelivered(_)));
         let mention = {
             let mut status = self.lock();
             status.messages_seen += 1;
@@ -369,7 +469,11 @@ impl Bridge {
             }
         };
         if mention {
-            self.note(&line);
+            if fault {
+                self.fail(&line);
+            } else {
+                self.note(&line);
+            }
         }
     }
 
@@ -385,13 +489,19 @@ impl Bridge {
     }
 
     pub fn note_send_failure(&self, message: &str) {
-        self.lock().last_outbound_error = Some(message.to_string());
-        self.note(&format!("discord: {message}"));
+        self.fail(&format!("discord: could not post a reply: {message}"));
     }
 
     pub fn summary(&self) -> String {
         let status = self.lock();
         status.summary(&self.allowed_user_id, &self.fallback_channel)
+    }
+
+    /// The `/discord` report, one line at a time and marked with whether it
+    /// reports a fault, so the TUI can draw the broken parts as errors.
+    pub fn report(&self) -> Vec<StatusLine> {
+        let status = self.lock();
+        status.lines(&self.allowed_user_id, &self.fallback_channel)
     }
 }
 
@@ -731,7 +841,7 @@ pub fn spawn(
         );
     }
     if config.discord.bot_token.trim().is_empty() {
-        bridge.note("discord: bot_token is empty, replies will be rejected with 401");
+        bridge.fail("discord: bot_token is empty, every reply will be rejected with 401");
     }
     if config.discord.allowed_user_id.trim().is_empty() {
         bridge.note(
@@ -762,7 +872,7 @@ async fn connect_loop(
     let mut backoff = Backoff::new(BACKOFF_START, BACKOFF_MAX);
     let mut intents = INTENTS;
     loop {
-        bridge.set_state("connecting to the gateway");
+        bridge.set_state("connecting to the gateway", false);
         let outcome = gateway_session(
             &config,
             &agent_tx,
@@ -781,29 +891,25 @@ async fn connect_loop(
                     session.clear();
                     bridge.set_state(
                         "reconnecting without the Message Content Intent: server text is empty",
+                        true,
                     );
-                    bridge.note(
+                    bridge.fail(
                         "discord: gateway rejected the privileged Message Content Intent (4013); \
                          reconnecting without it. Enable it on the bot in the Discord developer \
                          portal to read server channel text; DMs keep working.",
                     );
                     continue;
                 }
-                bridge.set_state(format!("disconnected: {}", error.message).as_str());
-                match error.reconnect {
-                    Reconnect::Fatal => {
-                        bridge.note(&format!("discord gateway stopped: {}", error.message));
-                        bridge.set_state("stopped: the bridge is not connected");
-                        return;
-                    }
-                    Reconnect::Fresh => {
-                        session.clear();
-                        bridge.note(&format!("discord gateway error: {}", error.message));
-                    }
-                    Reconnect::Resume => {
-                        bridge.note(&format!("discord gateway error: {}", error.message));
-                    }
+                bridge.set_state(format!("disconnected: {}", error.message).as_str(), true);
+                if error.reconnect == Reconnect::Fatal {
+                    bridge.fail(&format!("discord gateway stopped: {}", error.message));
+                    bridge.set_state("stopped: the bridge is not connected", true);
+                    return;
                 }
+                if error.reconnect == Reconnect::Fresh {
+                    session.clear();
+                }
+                bridge.fail(&format!("discord gateway error: {}", error.message));
             }
         }
         let wait = backoff.plan(jitter());
@@ -899,7 +1005,12 @@ async fn gateway_session(
                 let frame = frame.ok_or_else(|| GatewayError::new("gateway closed", Reconnect::Resume))?;
                 match frame.map_err(|e| GatewayError::new(e.to_string(), Reconnect::Resume))? {
                     Message::Text(text) => {
-                        let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { continue };
+                        let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                            if let Some(note) = notices.unreadable_frame() {
+                                bridge.fail(&note);
+                            }
+                            continue;
+                        };
                         if let Some(seq) = value["s"].as_u64() {
                             session.seq = seq;
                         }
@@ -925,13 +1036,21 @@ async fn gateway_session(
                                 bridge.note_inbound(&value["d"], &inbound);
                                 let guild = is_guild_message(&value["d"]);
                                 if let Some(note) = notices.notice(&inbound, guild) {
-                                    bridge.note(&note);
+                                    match &inbound {
+                                        Inbound::Ignored(Ignore::NoText) => bridge.fail(&note),
+                                        _ => bridge.note(&note),
+                                    }
                                 }
                             }
                             _ => continue,
                         }
                     }
                     Message::Close(frame) => return Err(close_error(frame)),
+                    Message::Binary(_) => {
+                        if let Some(note) = notices.binary_frame() {
+                            bridge.fail(&note);
+                        }
+                    }
                     _ => continue,
                 }
             }
@@ -955,6 +1074,16 @@ pub struct ReadyInfo {
 }
 
 impl ReadyInfo {
+    /// True when rho asked for the privileged intent that carries server text
+    /// and Discord did not apply it, which is why a connected bot can appear to
+    /// ignore a server: the messages arrive with empty `content`.
+    pub fn content_missing(&self) -> bool {
+        self.requested_intents & GUILD_MESSAGE_CONTENT != 0
+            && self
+                .granted_intents
+                .is_some_and(|granted| granted & GUILD_MESSAGE_CONTENT == 0)
+    }
+
     /// Says out loud whether Discord actually granted the privileged intent, so
     /// a portal setting that was not saved (or a session that already degraded)
     /// is visible instead of looking like a bot that ignores the server.
@@ -967,10 +1096,9 @@ impl ReadyInfo {
         let Some(granted) = self.granted_intents else {
             return status;
         };
-        let requested = self.requested_intents & GUILD_MESSAGE_CONTENT != 0;
         let content = if granted & GUILD_MESSAGE_CONTENT != 0 {
             "message content granted"
-        } else if requested {
+        } else if self.content_missing() {
             "WARNING: Discord did not grant the Message Content Intent, server text is empty"
         } else {
             "rho is not requesting the Message Content Intent, server text is empty"
@@ -1034,14 +1162,15 @@ fn route_message(
     router: &Router,
 ) -> Inbound {
     let inbound = accept_message(d, &config.allowed_user_id);
-    if let Inbound::Prompted { channel_id, text } = &inbound {
-        if agent_tx
-            .send(AgentCommand::Prompt { text: text.clone() })
-            .is_ok()
-        {
-            router.expect_reply(channel_id);
-        }
+    let Inbound::Prompted { channel_id, text } = &inbound else {
+        return inbound;
+    };
+    if let Err(e) = agent_tx.send(AgentCommand::Prompt { text: text.clone() }) {
+        return Inbound::Ignored(Ignore::NotDelivered(format!(
+            "the agent is not accepting prompts ({e})"
+        )));
     }
+    router.expect_reply(channel_id);
     inbound
 }
 
@@ -1090,18 +1219,33 @@ async fn reply_relay(
         let text = match events.recv().await {
             Ok(AgentEvent::AssistantDone { text }) | Ok(AgentEvent::Error(text)) => text,
             Ok(_) => continue,
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                bridge.fail(&format!(
+                    "discord: fell behind the event stream and lost {skipped} event(s), an \
+                     answer may never have been posted"
+                ));
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                bridge.fail("discord: the agent shut down, so no more replies will be posted");
+                break;
+            }
         };
         let Some(channel_id) = router.take() else {
             continue;
         };
         let chunks = chunk_message(&text);
+        if chunks.is_empty() {
+            bridge.fail(&format!(
+                "discord: the answer for #{channel_id} had no text, so nothing was posted"
+            ));
+            continue;
+        }
         bridge.note_answer(&channel_id, chunks.len());
         let dropped = push_chunks(&outbox, &channel_id, &chunks);
         if dropped > 0 {
-            bridge.note(&format!(
-                "discord: dropped {dropped} reply chunk(s), outbox full"
+            bridge.fail(&format!(
+                "discord: dropped {dropped} reply chunk(s) for #{channel_id}, outbox full"
             ));
         }
     }
@@ -1169,6 +1313,7 @@ impl Outbox {
 
     async fn run(mut self) {
         while let Some(posted) = self.outbox.recv().await {
+            let target = format!("#{}", posted.channel_id.trim());
             match deliver(
                 &self.poster,
                 &mut self.bucket,
@@ -1178,10 +1323,14 @@ impl Outbox {
             .await
             {
                 Delivery::Sent => self.bridge.note_reply_posted(1),
-                Delivery::Failed(message) => self.bridge.note_send_failure(&message),
-                Delivery::GaveUp { attempts, message } => {
+                Delivery::Failed(message) => {
                     self.bridge
-                        .note_send_failure(&format!("{message} (after {attempts} attempts)"));
+                        .note_send_failure(&format!("{target}: {message}"));
+                }
+                Delivery::GaveUp { attempts, message } => {
+                    self.bridge.note_send_failure(&format!(
+                        "{target}: {message} (after {attempts} attempts)"
+                    ));
                 }
             }
         }
@@ -1340,6 +1489,18 @@ mod tests {
     }
 
     #[test]
+    fn frames_the_bridge_cannot_read_are_admitted_once() {
+        let mut notices = Notices::default();
+        assert!(notices
+            .unreadable_frame()
+            .unwrap()
+            .contains("not valid JSON"));
+        assert!(notices.unreadable_frame().is_none());
+        assert!(notices.binary_frame().unwrap().contains("binary frame"));
+        assert!(notices.binary_frame().is_none());
+    }
+
+    #[test]
     fn servers_are_listed_with_their_state() {
         assert_eq!(
             guild_summary(&json!({"id": "1", "name": "Work"})),
@@ -1424,6 +1585,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failures_reach_the_transcript_as_errors_and_are_remembered() {
+        let (bridge, mut rx) = bridge(false);
+        assert_eq!(bridge.report().iter().filter(|l| l.fault).count(), 0);
+
+        bridge.fail("discord: could not post a reply: #9: discord REST 403: Missing Permissions");
+        match rx.recv().await {
+            Ok(AgentEvent::Fault(text)) => assert!(text.contains("403"), "{text}"),
+            other => panic!("expected a bridge error, got {other:?}"),
+        }
+
+        let summary = bridge.summary();
+        assert!(summary.contains("1 error(s) reported"), "{summary}");
+        assert!(summary.contains("403: Missing Permissions"), "{summary}");
+        let faults = bridge
+            .report()
+            .into_iter()
+            .filter(|l| l.fault)
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(faults.matches("discord:").count(), 1, "{faults}");
+        assert!(faults.contains("403"), "{faults}");
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_stopped_is_flagged_in_the_report() {
+        let (bridge, _rx) = bridge(false);
+        bridge.set_state("stopped: the bridge is not connected", true);
+        assert!(
+            bridge
+                .report()
+                .iter()
+                .any(|l| l.fault && l.text.contains("stopped")),
+            "{}",
+            bridge.summary()
+        );
+    }
+
+    #[tokio::test]
     async fn status_explains_a_server_channel_that_stays_unread() {
         let (bridge, _rx) = bridge(false);
         bridge.note_ready(&ReadyInfo {
@@ -1451,6 +1651,17 @@ mod tests {
         assert!(summary.contains("403 Forbidden"), "{summary}");
         assert!(summary.contains("allowed_user_id: 42"), "{summary}");
         assert!(summary.contains("fallback channel: 123"), "{summary}");
+        let faults = bridge
+            .report()
+            .into_iter()
+            .filter(|l| l.fault)
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            faults.contains("Message Content Intent NOT granted"),
+            "{faults}"
+        );
     }
 
     #[tokio::test]
@@ -1708,6 +1919,66 @@ mod tests {
         assert_eq!(push_chunks(&tx, "9", &chunks), chunks.len());
     }
 
+    async fn next_bridge_error(notes: &mut broadcast::Receiver<AgentEvent>) -> String {
+        loop {
+            match notes.recv().await {
+                Ok(AgentEvent::Fault(text)) => return text,
+                Ok(_) => continue,
+                Err(e) => panic!("the event stream ended: {e}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_no_text_says_nothing_was_posted() {
+        let (events, mut notes) = broadcast::channel(16);
+        let bridge = Arc::new(Bridge::new(&config("123"), events.clone(), false));
+        let (outbox, mut posted) = mpsc::channel(4);
+        let relay_outbox = outbox.clone();
+        tokio::spawn(reply_relay(
+            events.subscribe(),
+            relay_outbox,
+            Arc::new(Router::new("123")),
+            bridge.clone(),
+        ));
+
+        events
+            .send(AgentEvent::AssistantDone {
+                text: "   ".to_string(),
+            })
+            .unwrap();
+
+        let text = next_bridge_error(&mut notes).await;
+        assert!(text.contains("no text"), "{text}");
+        assert!(posted.try_recv().is_err());
+        assert!(bridge.summary().contains("0 reply chunk(s) sent"));
+    }
+
+    #[tokio::test]
+    async fn a_full_outbox_reports_the_chunks_it_drops() {
+        let (events, mut notes) = broadcast::channel(16);
+        let bridge = Arc::new(Bridge::new(&config("123"), events.clone(), false));
+        let (outbox, mut posted) = mpsc::channel(1);
+        let relay_outbox = outbox.clone();
+        tokio::spawn(reply_relay(
+            events.subscribe(),
+            relay_outbox,
+            Arc::new(Router::new("123")),
+            bridge.clone(),
+        ));
+
+        events
+            .send(AgentEvent::AssistantDone {
+                text: "x".repeat(2500),
+            })
+            .unwrap();
+
+        let text = next_bridge_error(&mut notes).await;
+        assert!(text.contains("dropped 1 reply chunk"), "{text}");
+        assert!(text.contains("#123"), "{text}");
+        assert_eq!(posted.try_recv().unwrap().text, "x".repeat(2000));
+    }
+
     struct ScriptedPoster {
         script: RefCell<VecDeque<Result<(), (String, Retry)>>>,
         attempts: Cell<u32>,
@@ -1909,6 +2180,42 @@ mod tests {
 
         assert!(rx.try_recv().is_err());
         assert_eq!(router.take().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn a_prompt_the_agent_will_not_take_is_reported_as_undelivered() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let router = Router::new("7");
+
+        let inbound = route_message(&config("9"), &posted("build it"), &tx, &router);
+        let Inbound::Ignored(Ignore::NotDelivered(reason)) = &inbound else {
+            panic!("expected an undelivered message, got {inbound:?}");
+        };
+        assert!(reason.contains("not accepting prompts"), "{reason}");
+        let line = arrival(&posted("build it"), &inbound, Some("Work"));
+        assert!(line.contains("not queued"), "{line}");
+        assert!(line.contains("@alice"), "{line}");
+        assert_eq!(router.take().as_deref(), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_message_is_an_error_and_not_a_queued_prompt() {
+        let (bridge, mut rx) = bridge(false);
+        let inbound = Inbound::Ignored(Ignore::NotDelivered(
+            "the agent is not accepting prompts".to_string(),
+        ));
+
+        bridge.note_inbound(&posted("build it"), &inbound);
+
+        match rx.recv().await {
+            Ok(AgentEvent::Fault(text)) => assert!(text.contains("not queued"), "{text}"),
+            other => panic!("expected a bridge error, got {other:?}"),
+        }
+        let status = bridge.status.lock().unwrap();
+        assert_eq!(status.messages_seen, 1);
+        assert_eq!(status.prompts_queued, 0);
+        assert_eq!(status.errors, 1);
     }
 
     #[test]

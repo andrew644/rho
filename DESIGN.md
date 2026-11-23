@@ -30,7 +30,13 @@ rho
 - `agent::Agent` owns the conversation (`Vec<Message>`) and a `mpsc` event channel.
 - The TUI (and the Discord bridge) feed user prompts into the agent and render
   `AgentEvent`s: `AssistantTextDelta`, `ReasoningDelta`, `ToolStarted`,
-  `ToolFinished`, `TurnDone`, `LoopProgress`, `Info`, `ContextUsage`, `Error`.
+  `ToolFinished`, `TurnDone`, `LoopProgress`, `Info`, `ContextUsage`, `Error`
+  and `Fault`. Anything worth telling the user about travels as one of these,
+  so the transcript — not the stderr the TUI paints over — is where it lands.
+  `Error` means this prompt got no answer; `Fault` means something is broken
+  but the agent carried on (a session that is no longer being saved, a Discord
+  reply that was refused), so the print runner only warns and the Discord reply
+  relay never mistakes it for an answer.
 - Only one in-flight request to the model at a time (local server cannot
   handle concurrency), so the agent processes prompts from a queue serially.
 - After every command the agent persists the conversation to its session file
@@ -210,19 +216,27 @@ loop:
 - Silence is explained rather than guessed at, and the explanation is drawn in
   the rho window: the TUI owns the terminal, so every bridge note arrives as a
   transcript line (only headless runs, which have no TUI, write them to
-  stderr). `READY` reports the intents Discord granted and warns when it did
-  not grant the privileged one, each `GUILD_CREATE` reports the server name/id
-  and whether it is available, every `MESSAGE_CREATE` reports who sent it from
-  where and what rho did with it (queued, empty content, wrong author, bot),
-  and the first allowed server message that arrives with empty `content` and
-  the first author rejected by `allowed_user_id` each add a one-line hint.
-  The bridge keeps a `Status` (state, granted intents, servers, message and
-  reply counters, last inbound line, last send error) behind an `Arc<Mutex<_>>`
-  that the TUI renders for `/discord`.
+  stderr). Routine news is `Info` and anything the bridge failed to do is a
+  `Fault`, which the transcript draws as an error line and the reply relay —
+  which answers the agent's own `Error` text — can never mistake for an answer.
+  `READY` reports the intents Discord granted and faults when it did not grant
+  the privileged one, each `GUILD_CREATE` reports the server name/id and whether
+  it is available, every `MESSAGE_CREATE` reports who sent it from where and
+  what rho did with it (queued, empty content, wrong author, bot, never
+  delivered to the agent), and the first allowed server message that arrives
+  with empty `content`, the first author rejected by `allowed_user_id`, the
+  first frame that does not parse and the first binary frame each add a
+  one-line explanation — the ones that mean rho cannot do what it was asked are
+  sent as faults, the rest as notes. The bridge keeps a `Status` (state,
+  granted intents, servers, message and reply counters, last inbound line,
+  error count and last error) behind an `Arc<Mutex<_>>`, and the TUI renders it
+  for `/discord` one `StatusLine` at a time, each marked with whether it is
+  reporting a fault so the broken parts come up as errors.
 - A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,
   5xx waits a second; up to 3 attempts per chunk. Other 4xx (bad token,
   missing permissions) are not retried. When the outbox is full the newest
-  chunks are dropped rather than blocking the agent.
+  chunks are dropped rather than blocking the agent. Refused and dropped
+  replies are reported as failures naming the channel they were meant for.
 - Shares the same serial prompt queue as the TUI, so the two never issue
   concurrent model requests.
 
