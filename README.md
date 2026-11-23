@@ -88,6 +88,7 @@ handling).
 /new                                        start a new session
 /resume [n]                                 list recent sessions / open one
 /session                                    session file, id, message/token counts
+/discord                                    bridge status: connection, intents, servers, last message in/out
 /name <text>                                name the current session
 /model [id]                                 list models / switch
 /pwd [path]                                 show / change the working directory
@@ -175,8 +176,20 @@ the developer portal. When the intent is not granted the gateway closes the
 `IDENTIFY` with `4013 Disallowed intents`; rho drops the intent, prints a
 warning and reconnects, so DMs keep working but server channels stay unread.
 
-When server messages still seem to vanish, stderr says why:
+When server messages still seem to vanish, the bridge says why **in the
+transcript** — a TUI owns the terminal, so its notes are drawn as lines in the
+rho window rather than written to stderr (headless `rho -p` runs have no TUI
+and keep printing them to stderr). Every message the gateway delivers gets one
+line, so if nothing appears at all, Discord never sent it:
 
+- `@alice in server "Work" #9: "build it" — queued as a prompt` — the message
+  arrived and reached the agent's queue; `DM #7` is the same for direct
+  messages.
+- `@alice in server "Work" #9: arrived with no text content, so nothing was
+  queued` — the message reached rho with an empty `content`, so the *Message
+  Content Intent* is not being applied.
+- `@bob in DM #7: ignored, user id 123 is not allowed_user_id` — right bot,
+  wrong author; rho remembers the id it saw.
 - `discord gateway identified (intents 0x1900, message content granted)` —
   Discord confirms the intent on the live session; `WARNING: Discord did not
   grant the Message Content Intent` means the portal switch is off (or was
@@ -184,10 +197,12 @@ When server messages still seem to vanish, stderr says why:
 - `discord: server "Name" (id) available` — one line per server the bot is in
   and can read; a missing server means the bot was never invited there or
   lacks *View Channel*.
-- `discord: a server message arrived with no text ...` — the message reached
-  rho with an empty `content`, so the intent is not being applied.
-- `discord: ignoring messages from user id ...` — the author does not match
-  `allowed_user_id`.
+
+`/discord` prints the same picture on demand: connection state, the intents
+Discord granted, the servers the bot can see, how many messages arrived, how
+many were queued as prompts, how many reply chunks went out, the last inbound
+line and the last send error. Messages from other bots are counted but only
+mentioned the first time, so a busy channel cannot push your transcript along.
 
 Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
 retried after the `Retry-After` Discord reports (up to 3 attempts); a full
@@ -195,7 +210,7 @@ outbox drops the newest chunks instead of blocking the agent. Dropped
 gateway connections resume with `op 6` using the saved `session_id`/`seq` when
 possible, otherwise they re-identify, and reconnect waits back off from 1 s to
 60 s. Authentication failures (`4004`, `4014`) stop the bridge instead of
-retrying; progress and failures print to stderr.
+retrying; progress and failures are reported the same way as inbound traffic.
 
 Replies are posted with `Authorization: Bot <token>`, so `discord.bot_token`
 must hold the bot token from the developer portal (not an OAuth2 access

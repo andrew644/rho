@@ -207,11 +207,18 @@ loop:
   `Authorization: Bot <token>` (Discord rejects `Bearer` for bot tokens with
   `401`) at 4 messages per 5 s, so chunk bursts stay under Discord's
   per-channel limit.
-- Silence is explained rather than guessed at: `READY` prints the intents
-  Discord granted and warns when it did not grant the privileged one, each
-  `GUILD_CREATE` prints the server name/id and whether it is available, and
-  the first allowed server message that arrives with empty `content` and the
-  first author rejected by `allowed_user_id` each print a one-line hint.
+- Silence is explained rather than guessed at, and the explanation is drawn in
+  the rho window: the TUI owns the terminal, so every bridge note arrives as a
+  transcript line (only headless runs, which have no TUI, write them to
+  stderr). `READY` reports the intents Discord granted and warns when it did
+  not grant the privileged one, each `GUILD_CREATE` reports the server name/id
+  and whether it is available, every `MESSAGE_CREATE` reports who sent it from
+  where and what rho did with it (queued, empty content, wrong author, bot),
+  and the first allowed server message that arrives with empty `content` and
+  the first author rejected by `allowed_user_id` each add a one-line hint.
+  The bridge keeps a `Status` (state, granted intents, servers, message and
+  reply counters, last inbound line, last send error) behind an `Arc<Mutex<_>>`
+  that the TUI renders for `/discord`.
 - A `429` waits for `Retry-After` (or `X-RateLimit-Reset-After`) and retries,
   5xx waits a second; up to 3 attempts per chunk. Other 4xx (bad token,
   missing permissions) are not retried. When the outbox is full the newest

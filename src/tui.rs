@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::agent::{AgentCommand, AgentEvent};
 use crate::clipboard::{Clipboard, ClipboardMode};
 use crate::config::ThemeName;
+use crate::discord::Bridge;
 use crate::loops::parse_loop_spec;
 use crate::selection::{self, Anchor, Selection};
 use crate::session::{self, SessionInfo};
@@ -40,6 +41,7 @@ pub enum Command {
     New,
     Resume(String),
     Session,
+    Discord,
     Name(String),
     Model(String),
     Pwd(String),
@@ -91,6 +93,7 @@ pub fn classify_input(input: &str, template_names: &[String]) -> Option<InputAct
             "new" => Command::New,
             "resume" => Command::Resume(args.to_string()),
             "session" => Command::Session,
+            "discord" => Command::Discord,
             "name" => Command::Name(args.to_string()),
             "model" => Command::Model(args.to_string()),
             "pwd" => Command::Pwd(args.to_string()),
@@ -281,9 +284,9 @@ struct InputLayout {
     cursor_col: usize,
 }
 
-const BUILTIN_COMMANDS: [&str; 12] = [
-    "compact", "exit", "help", "loop", "model", "name", "new", "pwd", "quit", "resume", "session",
-    "stop",
+const BUILTIN_COMMANDS: [&str; 13] = [
+    "compact", "discord", "exit", "help", "loop", "model", "name", "new", "pwd", "quit", "resume",
+    "session", "stop",
 ];
 
 fn expand_home(token: &str) -> String {
@@ -524,6 +527,7 @@ pub struct App {
     text_area: Rect,
     clipboard: Clipboard,
     notice: Option<(String, Instant)>,
+    discord: Option<Arc<Bridge>>,
 }
 
 impl App {
@@ -588,6 +592,7 @@ impl App {
             text_area: Rect::ZERO,
             clipboard: Clipboard::new(ClipboardMode::default()),
             notice: None,
+            discord: None,
         }
     }
 
@@ -1293,7 +1298,7 @@ impl App {
 
     fn show_help(&mut self) {
         self.push(
-            "commands: /loop [forever|N|10m|until \"cond\"] <task>, /compact [instructions], /new, /resume [n], /session, /name <text>, /model [id], /pwd [path], /stop, /help, /quit",
+            "commands: /loop [forever|N|10m|until \"cond\"] <task>, /compact [instructions], /new, /resume [n], /session, /discord, /name <text>, /model [id], /pwd [path], /stop, /help, /quit",
             Kind::Info,
         );
         self.push("!cmd runs a shell command and shares its output with the model; !!cmd runs it without sharing", Kind::Info);
@@ -1403,6 +1408,17 @@ impl App {
                     Kind::Info,
                 );
             }
+            Some(InputAction::Command(Command::Discord)) => match &self.discord {
+                Some(bridge) => {
+                    for line in bridge.summary().lines() {
+                        self.push(line, Kind::Info);
+                    }
+                }
+                None => self.push(
+                    "discord bridge is off; set discord.enabled and discord.bot_token in config.yaml",
+                    Kind::Info,
+                ),
+            },
             Some(InputAction::Command(Command::Name(name))) => {
                 let _ = agent.send(AgentCommand::SetName { name: name.clone() });
                 self.session_name = if name.is_empty() { None } else { Some(name) };
@@ -1606,6 +1622,7 @@ pub struct TuiOptions {
     pub theme: ThemeName,
     pub session_path: Option<String>,
     pub clipboard: ClipboardMode,
+    pub discord: Option<Arc<Bridge>>,
 }
 
 async fn run_inner(
@@ -1625,6 +1642,7 @@ async fn run_inner(
         opts.session_path,
     );
     app.clipboard = Clipboard::new(opts.clipboard);
+    app.discord = opts.discord;
     let mut keys = crossterm::event::EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
     loop {
@@ -2306,6 +2324,7 @@ mod wrap_tests {
 #[cfg(test)]
 mod draw_tests {
     use super::*;
+    use crate::config::DiscordConfig;
     use ratatui::backend::TestBackend;
 
     fn test_app() -> App {
@@ -2348,6 +2367,41 @@ mod draw_tests {
             AgentCommand::SetPwd { path } => assert_eq!(path, PathBuf::from("../elsewhere")),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn discord_command_reports_the_bridge_or_says_it_is_off() {
+        let tpl: Vec<String> = vec![];
+        assert_eq!(
+            classify_input("/discord", &tpl),
+            Some(InputAction::Command(Command::Discord))
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.on_submit("/discord", &tx);
+        assert!(app
+            .entries
+            .iter()
+            .any(|e| e.text.contains("discord bridge is off")));
+
+        let (events, _keep) = broadcast::channel(8);
+        let config = DiscordConfig {
+            enabled: true,
+            bot_token: "tok".to_string(),
+            channel_id: "chan".to_string(),
+            allowed_user_id: "42".to_string(),
+        };
+        app.discord = Some(Arc::new(Bridge::new(&config, events, false)));
+        app.on_submit("/discord", &tx);
+        let text: String = app
+            .entries
+            .iter()
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("connecting to the gateway"), "{text}");
+        assert!(text.contains("allowed_user_id: 42"), "{text}");
+        assert!(text.contains("fallback channel: chan"), "{text}");
     }
 
     #[test]

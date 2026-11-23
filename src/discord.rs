@@ -120,6 +120,281 @@ pub fn guild_summary(d: &Value) -> String {
     format!("discord: server \"{name}\" ({id}) {state}")
 }
 
+/// Where an inbound message came from, in the words the transcript shows.
+pub fn arrival(d: &Value, inbound: &Inbound, server: Option<&str>) -> String {
+    let author = d["author"]["username"]
+        .as_str()
+        .or_else(|| d["author"]["id"].as_str())
+        .unwrap_or("unknown");
+    let channel = d["channel_id"].as_str().unwrap_or("?");
+    let place = match server {
+        Some(name) => format!("server \"{name}\" #{channel}"),
+        None => format!("DM #{channel}"),
+    };
+    let who = format!("@{author} in {place}");
+    match inbound {
+        Inbound::Prompted { text, .. } => {
+            format!("{who}: {} — queued as a prompt", quoted(text))
+        }
+        Inbound::Ignored(Ignore::FromBot) => format!("{who}: ignored, the author is a bot"),
+        Inbound::Ignored(Ignore::DisallowedUser(id)) => {
+            format!("{who}: ignored, user id {id} is not allowed_user_id")
+        }
+        Inbound::Ignored(Ignore::NoText) => {
+            format!("{who}: arrived with no text content, so nothing was queued")
+        }
+    }
+}
+
+const QUOTED_MAX: usize = 60;
+
+fn quoted(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let flat = flat.trim();
+    let mut chars = flat.chars();
+    let shortened: String = chars.by_ref().take(QUOTED_MAX).collect();
+    if chars.next().is_some() {
+        format!("\"{shortened}…\"")
+    } else {
+        format!("\"{shortened}\"")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Server {
+    pub id: String,
+    pub name: String,
+    pub available: bool,
+}
+
+impl Server {
+    fn label(&self) -> String {
+        if self.available {
+            format!("\"{}\" ({})", self.name, self.id)
+        } else {
+            format!("\"{}\" ({} unavailable)", self.name, self.id)
+        }
+    }
+}
+
+/// What the bridge knows about the live connection. The TUI shows it through
+/// `/discord` because stderr is invisible while the transcript owns the screen.
+#[derive(Debug, Default)]
+pub struct Status {
+    pub state: String,
+    pub granted_intents: Option<u64>,
+    pub message_content_granted: bool,
+    pub servers: Vec<Server>,
+    pub messages_seen: usize,
+    pub bot_messages_seen: usize,
+    pub prompts_queued: usize,
+    pub replies_posted: usize,
+    pub last_inbound: Option<String>,
+    pub last_outbound_error: Option<String>,
+}
+
+impl Status {
+    fn upsert_server(&mut self, server: Server) {
+        match self.servers.iter_mut().find(|s| s.id == server.id) {
+            Some(seen) => *seen = server,
+            None => self.servers.push(server),
+        }
+    }
+
+    fn server_name(&self, id: &str) -> Option<String> {
+        self.servers
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone())
+    }
+
+    pub fn summary(&self, allowed_user_id: &str, fallback_channel: &str) -> String {
+        let state = if self.state.is_empty() {
+            "connecting to the gateway".to_string()
+        } else {
+            self.state.clone()
+        };
+        let servers = if self.servers.is_empty() {
+            "no servers visible: invite the bot to the server and give it View Channel (DMs need neither)".to_string()
+        } else {
+            format!(
+                "servers: {}",
+                self.servers
+                    .iter()
+                    .map(Server::label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let allowed = if allowed_user_id.trim().is_empty() {
+            "allowed_user_id is empty: anyone who can reach the bot can drive the agent".to_string()
+        } else {
+            format!("allowed_user_id: {}", allowed_user_id.trim())
+        };
+        let fallback = if fallback_channel.trim().is_empty() {
+            "no fallback channel: prompts typed in rho are not mirrored to Discord".to_string()
+        } else {
+            format!("fallback channel: {}", fallback_channel.trim())
+        };
+        let intents = match self.granted_intents {
+            Some(granted) if self.message_content_granted => {
+                format!("intents {granted:#06x}, message content granted")
+            }
+            Some(granted) => {
+                format!("intents {granted:#06x}, Message Content Intent NOT granted: server text arrives empty")
+            }
+            None => "intents not reported yet".to_string(),
+        };
+        [
+            format!("discord: {state}"),
+            format!("discord: {intents}"),
+            format!("discord: {servers}"),
+            format!(
+                "discord: {} message(s) in ({} from bots), {} queued as prompts, {} reply chunk(s) sent",
+                self.messages_seen,
+                self.bot_messages_seen,
+                self.prompts_queued,
+                self.replies_posted
+            ),
+            format!(
+                "discord: last message in: {}",
+                self.last_inbound.as_deref().unwrap_or("none")
+            ),
+            format!(
+                "discord: last send error: {}",
+                self.last_outbound_error.as_deref().unwrap_or("none")
+            ),
+            format!("discord: {allowed}"),
+            format!("discord: {fallback}"),
+        ]
+        .join("\n")
+    }
+}
+
+/// The bridge's voice. A TUI owns the terminal, so its notes go into the
+/// transcript as `Info` events; only headless runs (no TUI drawing over stderr)
+/// write them to the console.
+pub struct Bridge {
+    events: broadcast::Sender<AgentEvent>,
+    console: bool,
+    allowed_user_id: String,
+    fallback_channel: String,
+    status: Mutex<Status>,
+}
+
+impl Bridge {
+    pub fn new(
+        config: &DiscordConfig,
+        events: broadcast::Sender<AgentEvent>,
+        console: bool,
+    ) -> Self {
+        Self {
+            events,
+            console,
+            allowed_user_id: config.allowed_user_id.clone(),
+            fallback_channel: config.channel_id.clone(),
+            status: Mutex::new(Status {
+                state: "connecting to the gateway".to_string(),
+                ..Status::default()
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Status> {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn note(&self, message: &str) {
+        if self.console {
+            eprintln!("{message}");
+        } else {
+            let _ = self.events.send(AgentEvent::Info(message.to_string()));
+        }
+    }
+
+    pub fn set_state(&self, state: &str) {
+        self.lock().state = state.to_string();
+    }
+
+    pub fn note_ready(&self, ready: &ReadyInfo) {
+        {
+            let mut status = self.lock();
+            status.state = ready.summary();
+            status.granted_intents = ready.granted_intents;
+            status.message_content_granted = ready
+                .granted_intents
+                .is_some_and(|granted| granted & GUILD_MESSAGE_CONTENT != 0);
+        }
+        self.note(&format!("discord gateway {}", ready.summary()));
+    }
+
+    pub fn note_server(&self, d: &Value) {
+        let server = Server {
+            id: d["id"].as_str().unwrap_or("?").to_string(),
+            name: d["name"].as_str().unwrap_or("unnamed").to_string(),
+            available: !d["unavailable"].as_bool().unwrap_or(false),
+        };
+        self.lock().upsert_server(server);
+        self.note(&guild_summary(d));
+    }
+
+    pub fn server_of(&self, d: &Value) -> Option<String> {
+        let id = d["guild_id"].as_str()?;
+        let status = self.lock();
+        Some(status.server_name(id).unwrap_or_else(|| format!("id {id}")))
+    }
+
+    /// Says what arrived and what rho did with it, once per message; bot posts
+    /// are counted but only mentioned the first time so a busy channel cannot
+    /// push the transcript along.
+    pub fn note_inbound(&self, d: &Value, inbound: &Inbound) {
+        let line = arrival(d, inbound, self.server_of(d).as_deref());
+        let mention = {
+            let mut status = self.lock();
+            status.messages_seen += 1;
+            if matches!(inbound, Inbound::Ignored(Ignore::FromBot)) {
+                status.bot_messages_seen += 1;
+                status.bot_messages_seen == 1
+            } else {
+                if matches!(inbound, Inbound::Prompted { .. }) {
+                    status.prompts_queued += 1;
+                }
+                status.last_inbound = Some(line.clone());
+                true
+            }
+        };
+        if mention {
+            self.note(&line);
+        }
+    }
+
+    pub fn note_answer(&self, channel_id: &str, chunks: usize) {
+        let unit = if chunks == 1 { "chunk" } else { "chunks" };
+        self.note(&format!(
+            "discord: answering #{channel_id} with {chunks} {unit}"
+        ));
+    }
+
+    pub fn note_reply_posted(&self, chunks: usize) {
+        self.lock().replies_posted += chunks;
+    }
+
+    pub fn note_send_failure(&self, message: &str) {
+        self.lock().last_outbound_error = Some(message.to_string());
+        self.note(&format!("discord: {message}"));
+    }
+
+    pub fn summary(&self) -> String {
+        let status = self.lock();
+        status.summary(&self.allowed_user_id, &self.fallback_channel)
+    }
+}
+
 pub fn chunk_message(text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
@@ -439,42 +714,55 @@ impl Router {
     }
 }
 
+/// Start the bridge and hand back the status the TUI reads for `/discord`.
+/// `console` is true when no TUI is drawing on the terminal (print/headless
+/// runs), which is the only case where notes go to stderr.
 pub fn spawn(
     config: Config,
     agent_tx: mpsc::UnboundedSender<AgentCommand>,
     events: broadcast::Sender<AgentEvent>,
-) {
+    console: bool,
+) -> Arc<Bridge> {
+    let bridge = Arc::new(Bridge::new(&config.discord, events.clone(), console));
     if config.discord.channel_id.is_empty() {
-        eprintln!(
+        bridge.note(
             "discord: channel_id is empty, prompts typed in the TUI will not be posted; \
-             messages sent to the bot are still answered where they were sent"
+             messages sent to the bot are still answered where they were sent",
         );
     }
     if config.discord.bot_token.trim().is_empty() {
-        eprintln!("discord: bot_token is empty, replies will be rejected with 401");
+        bridge.note("discord: bot_token is empty, replies will be rejected with 401");
     }
     if config.discord.allowed_user_id.trim().is_empty() {
-        eprintln!(
+        bridge.note(
             "discord: allowed_user_id is empty, so anyone who can DM the bot or who shares a \
-             server with it can drive the agent; set discord.allowed_user_id to lock it down"
+             server with it can drive the agent; set discord.allowed_user_id to lock it down",
         );
     }
     let router = Arc::new(Router::new(&config.discord.channel_id));
     let (outbox_tx, outbox_rx) = mpsc::channel::<Posted>(OUTBOX_DEPTH);
-    tokio::spawn(reply_relay(events.subscribe(), outbox_tx, router.clone()));
-    tokio::spawn(Outbox::new(config.discord.clone(), outbox_rx).run());
-    tokio::spawn(connect_loop(config, agent_tx, router));
+    tokio::spawn(reply_relay(
+        events.subscribe(),
+        outbox_tx,
+        router.clone(),
+        bridge.clone(),
+    ));
+    tokio::spawn(Outbox::new(config.discord.clone(), outbox_rx, bridge.clone()).run());
+    tokio::spawn(connect_loop(config, agent_tx, router, bridge.clone()));
+    bridge
 }
 
 async fn connect_loop(
     config: Config,
     agent_tx: mpsc::UnboundedSender<AgentCommand>,
     router: Arc<Router>,
+    bridge: Arc<Bridge>,
 ) {
     let mut session = GatewaySession::default();
     let mut backoff = Backoff::new(BACKOFF_START, BACKOFF_MAX);
     let mut intents = INTENTS;
     loop {
+        bridge.set_state("connecting to the gateway");
         let outcome = gateway_session(
             &config,
             &agent_tx,
@@ -482,6 +770,7 @@ async fn connect_loop(
             &mut session,
             &mut backoff,
             intents,
+            &bridge,
         )
         .await;
         match outcome {
@@ -490,30 +779,38 @@ async fn connect_loop(
                 if let Some(leaner) = downgrade_intents(intents, error.close_code) {
                     intents = leaner;
                     session.clear();
-                    eprintln!(
+                    bridge.set_state(
+                        "reconnecting without the Message Content Intent: server text is empty",
+                    );
+                    bridge.note(
                         "discord: gateway rejected the privileged Message Content Intent (4013); \
                          reconnecting without it. Enable it on the bot in the Discord developer \
-                         portal to read server channel text; DMs keep working."
+                         portal to read server channel text; DMs keep working.",
                     );
                     continue;
                 }
+                bridge.set_state(format!("disconnected: {}", error.message).as_str());
                 match error.reconnect {
                     Reconnect::Fatal => {
-                        eprintln!("discord gateway stopped: {}", error.message);
+                        bridge.note(&format!("discord gateway stopped: {}", error.message));
+                        bridge.set_state("stopped: the bridge is not connected");
                         return;
                     }
                     Reconnect::Fresh => {
                         session.clear();
-                        eprintln!("discord gateway error: {}", error.message);
+                        bridge.note(&format!("discord gateway error: {}", error.message));
                     }
                     Reconnect::Resume => {
-                        eprintln!("discord gateway error: {}", error.message);
+                        bridge.note(&format!("discord gateway error: {}", error.message));
                     }
                 }
             }
         }
         let wait = backoff.plan(jitter());
-        eprintln!("discord: reconnecting in {:.1}s", wait.as_secs_f64());
+        bridge.note(&format!(
+            "discord: reconnecting in {:.1}s",
+            wait.as_secs_f64()
+        ));
         tokio::time::sleep(wait).await;
     }
 }
@@ -525,6 +822,7 @@ async fn gateway_session(
     session: &mut GatewaySession,
     backoff: &mut Backoff,
     intents: u64,
+    bridge: &Bridge,
 ) -> Gw<()> {
     let endpoint = session.endpoint();
     let want_resume = session.resumable();
@@ -572,7 +870,7 @@ async fn gateway_session(
     let handshake =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut ws, session, intents)).await;
     match handshake {
-        Ok(Ok(ready)) => eprintln!("discord gateway {}", ready.summary()),
+        Ok(Ok(ready)) => bridge.note_ready(&ready),
         Ok(Err(error)) => return Err(error),
         Err(_) => {
             return Err(GatewayError::new(
@@ -617,16 +915,17 @@ async fn gateway_session(
                                 ));
                             }
                             GatewayOp::Dispatch if value["t"].as_str() == Some("GUILD_CREATE") => {
-                                eprintln!("{}", guild_summary(&value["d"]));
+                                bridge.note_server(&value["d"]);
                             }
                             GatewayOp::Dispatch
                                 if value["t"].as_str() == Some("MESSAGE_CREATE") =>
                             {
                                 let inbound =
                                     route_message(&config.discord, &value["d"], agent_tx, router);
+                                bridge.note_inbound(&value["d"], &inbound);
                                 let guild = is_guild_message(&value["d"]);
                                 if let Some(note) = notices.notice(&inbound, guild) {
-                                    eprintln!("{note}");
+                                    bridge.note(&note);
                                 }
                             }
                             _ => continue,
@@ -785,6 +1084,7 @@ async fn reply_relay(
     mut events: broadcast::Receiver<AgentEvent>,
     outbox: mpsc::Sender<Posted>,
     router: Arc<Router>,
+    bridge: Arc<Bridge>,
 ) {
     loop {
         let text = match events.recv().await {
@@ -796,9 +1096,13 @@ async fn reply_relay(
         let Some(channel_id) = router.take() else {
             continue;
         };
-        let dropped = push_chunks(&outbox, &channel_id, &chunk_message(&text));
+        let chunks = chunk_message(&text);
+        bridge.note_answer(&channel_id, chunks.len());
+        let dropped = push_chunks(&outbox, &channel_id, &chunks);
         if dropped > 0 {
-            eprintln!("discord: dropped {dropped} reply chunk(s), outbox full");
+            bridge.note(&format!(
+                "discord: dropped {dropped} reply chunk(s), outbox full"
+            ));
         }
     }
 }
@@ -847,10 +1151,11 @@ struct Outbox {
     poster: RestPoster,
     bucket: Bucket,
     outbox: mpsc::Receiver<Posted>,
+    bridge: Arc<Bridge>,
 }
 
 impl Outbox {
-    fn new(config: DiscordConfig, outbox: mpsc::Receiver<Posted>) -> Self {
+    fn new(config: DiscordConfig, outbox: mpsc::Receiver<Posted>, bridge: Arc<Bridge>) -> Self {
         Self {
             poster: RestPoster {
                 http: reqwest::Client::new(),
@@ -858,6 +1163,7 @@ impl Outbox {
             },
             bucket: Bucket::new(SENDS_PER_WINDOW, SEND_WINDOW),
             outbox,
+            bridge,
         }
     }
 
@@ -871,10 +1177,11 @@ impl Outbox {
             )
             .await
             {
-                Delivery::Sent => {}
-                Delivery::Failed(message) => eprintln!("discord send failed: {message}"),
+                Delivery::Sent => self.bridge.note_reply_posted(1),
+                Delivery::Failed(message) => self.bridge.note_send_failure(&message),
                 Delivery::GaveUp { attempts, message } => {
-                    eprintln!("discord send failed after {attempts} attempts: {message}")
+                    self.bridge
+                        .note_send_failure(&format!("{message} (after {attempts} attempts)"));
                 }
             }
         }
@@ -1042,6 +1349,146 @@ mod tests {
             guild_summary(&json!({"id": "1", "unavailable": true})),
             "discord: server \"unnamed\" (1) unavailable"
         );
+    }
+
+    fn posted(content: &str) -> Value {
+        json!({
+            "channel_id": "9", "guild_id": "1", "content": content,
+            "author": {"id": "42", "username": "alice"}
+        })
+    }
+
+    fn direct(content: &str) -> Value {
+        json!({
+            "channel_id": "7", "content": content,
+            "author": {"id": "42", "username": "alice"}
+        })
+    }
+
+    fn bot_post() -> Value {
+        json!({
+            "channel_id": "9", "guild_id": "1", "content": "ping",
+            "author": {"id": "3", "username": "robby", "bot": true}
+        })
+    }
+
+    #[test]
+    fn arrivals_say_where_the_message_came_from() {
+        assert_eq!(
+            arrival(&direct("build it"), &prompted("7", "build it"), None),
+            "@alice in DM #7: \"build it\" — queued as a prompt"
+        );
+        assert_eq!(
+            arrival(
+                &posted("  fix\n the tests  "),
+                &prompted("9", "fix the tests"),
+                Some("Work")
+            ),
+            "@alice in server \"Work\" #9: \"fix the tests\" — queued as a prompt"
+        );
+        assert!(
+            arrival(&posted(""), &Inbound::Ignored(Ignore::NoText), Some("Work"))
+                .contains("no text content")
+        );
+        assert!(arrival(
+            &posted("hi"),
+            &Inbound::Ignored(Ignore::DisallowedUser("99".to_string())),
+            None
+        )
+        .contains("99 is not allowed_user_id"));
+    }
+
+    #[test]
+    fn long_arrivals_are_quoted_briefly() {
+        let text = "x".repeat(300);
+        let line = arrival(&direct(&text), &prompted("7", &text), None);
+        assert!(line.contains(&format!("\"{}…\"", "x".repeat(60))), "{line}");
+        assert!(line.chars().count() < 120, "{line}");
+    }
+
+    fn bridge(console: bool) -> (Arc<Bridge>, broadcast::Receiver<AgentEvent>) {
+        let (tx, rx) = broadcast::channel(16);
+        let mut cfg = config("123");
+        cfg.allowed_user_id = "42".to_string();
+        (Arc::new(Bridge::new(&cfg, tx, console)), rx)
+    }
+
+    #[tokio::test]
+    async fn bridge_notes_go_to_the_transcript_not_stderr() {
+        let (bridge, mut rx) = bridge(false);
+        bridge.note("discord: hello");
+        assert!(matches!(
+            rx.recv().await,
+            Ok(AgentEvent::Info(text)) if text == "discord: hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_explains_a_server_channel_that_stays_unread() {
+        let (bridge, _rx) = bridge(false);
+        bridge.note_ready(&ReadyInfo {
+            resumed: false,
+            requested_intents: INTENTS,
+            granted_intents: Some(INTENTS & !GUILD_MESSAGE_CONTENT),
+        });
+        bridge.note_server(&json!({"id": "1", "name": "Work"}));
+        bridge.note_inbound(&posted(""), &Inbound::Ignored(Ignore::NoText));
+        bridge.note_reply_posted(2);
+        bridge.note_send_failure("send failed: 403 Forbidden");
+        let summary = bridge.summary();
+        assert!(summary.contains("identified"), "{summary}");
+        assert!(
+            summary.contains("Message Content Intent NOT granted"),
+            "{summary}"
+        );
+        assert!(summary.contains("\"Work\" (1)"), "{summary}");
+        assert!(summary.contains("1 message(s) in"), "{summary}");
+        assert!(summary.contains("2 reply chunk(s) sent"), "{summary}");
+        assert!(
+            summary.contains("last message in: @alice in server \"Work\" #9"),
+            "{summary}"
+        );
+        assert!(summary.contains("403 Forbidden"), "{summary}");
+        assert!(summary.contains("allowed_user_id: 42"), "{summary}");
+        assert!(summary.contains("fallback channel: 123"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn an_unseen_server_is_named_in_the_status() {
+        let (bridge, _rx) = bridge(false);
+        bridge.note_inbound(&posted("hello"), &prompted("9", "hello"));
+        assert!(
+            bridge.summary().contains("no servers visible"),
+            "{}",
+            bridge.summary()
+        );
+        bridge.status.lock().unwrap().upsert_server(Server {
+            id: "1".to_string(),
+            name: "Work".to_string(),
+            available: false,
+        });
+        assert_eq!(bridge.server_of(&posted("x")).as_deref(), Some("Work"));
+        assert!(bridge.summary().contains("(1 unavailable)"));
+        assert!(bridge.summary().contains("intents not reported yet"));
+    }
+
+    #[tokio::test]
+    async fn bot_traffic_is_counted_but_only_mentioned_once() {
+        let (bridge, mut rx) = bridge(false);
+        bridge.note_inbound(&bot_post(), &Inbound::Ignored(Ignore::FromBot));
+        bridge.note_inbound(&bot_post(), &Inbound::Ignored(Ignore::FromBot));
+        assert!(matches!(rx.recv().await, Ok(AgentEvent::Info(_))));
+        assert!(rx.try_recv().is_err());
+
+        bridge.note_inbound(&posted(""), &Inbound::Ignored(Ignore::NoText));
+        bridge.note_inbound(&posted(""), &Inbound::Ignored(Ignore::NoText));
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+
+        let status = bridge.status.lock().unwrap();
+        assert_eq!(status.messages_seen, 4);
+        assert_eq!(status.bot_messages_seen, 2);
+        assert_eq!(status.prompts_queued, 0);
     }
 
     #[test]

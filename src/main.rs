@@ -128,9 +128,16 @@ async fn main() -> anyhow::Result<()> {
         event_tx.clone(),
         resumed.clone(),
     );
-    if config.discord.enabled {
-        rho::discord::spawn(config.clone(), agent_tx.clone(), event_tx.clone());
-    }
+    let bridge = if config.discord.enabled {
+        Some(rho::discord::spawn(
+            config.clone(),
+            agent_tx.clone(),
+            event_tx.clone(),
+            print_mode,
+        ))
+    } else {
+        None
+    };
 
     if print_mode {
         return run_print(agent_tx, event_rx.resubscribe(), prompt).await;
@@ -155,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         theme: config.theme,
         session_path: resumed.as_ref().map(|p| p.display().to_string()),
         clipboard: config.clipboard,
+        discord: bridge,
     };
     rho::tui::run(agent_tx, cancel, event_rx, tui).await
 }
