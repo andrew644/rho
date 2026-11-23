@@ -1,4 +1,4 @@
-use rho::agent::{Agent, AgentCommand, AgentEvent};
+use rho::agent::{Agent, AgentCommand, AgentEvent, Origin};
 use rho::client::Client;
 use rho::config::Config;
 use std::time::Duration;
@@ -41,6 +41,7 @@ async fn live_agent_uses_write_tool() {
             text: "Create a file named hello.txt whose only content is: hello rho. \
                    Then reply with exactly: DONE"
                 .to_string(),
+            origin: Origin::Local,
         })
         .unwrap();
 
@@ -48,8 +49,8 @@ async fn live_agent_uses_write_tool() {
         loop {
             let event = rx.recv().await.unwrap();
             match event {
-                AgentEvent::AssistantDone { text } => return Some(text),
-                AgentEvent::Error(e) => panic!("agent error: {e}"),
+                AgentEvent::AssistantDone { text, .. } => return Some(text),
+                AgentEvent::Error { message, .. } => panic!("agent error: {message}"),
                 _ => {}
             }
         }
@@ -73,6 +74,7 @@ async fn live_length_truncation_retries_once() {
     agent
         .send(AgentCommand::Prompt {
             text: "Count from 1 to 1000 separated by commas. No prose.".to_string(),
+            origin: Origin::Local,
         })
         .unwrap();
 
@@ -84,10 +86,10 @@ async fn live_length_truncation_retries_once() {
                 AgentEvent::Info(msg) if msg.contains("compacting and retrying") => {
                     saw_retry_note = true;
                 }
-                AgentEvent::Error(msg) if msg.contains("compact-and-retry") => {
+                AgentEvent::Error { message, .. } if message.contains("compact-and-retry") => {
                     saw_recovery_failure = true;
                 }
-                AgentEvent::Idle => return,
+                AgentEvent::Idle { .. } => return,
                 _ => {}
             }
         }

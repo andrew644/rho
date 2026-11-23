@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::agent::{AgentCommand, AgentEvent};
+use crate::agent::{AgentCommand, AgentEvent, Origin};
 use crate::clipboard::{Clipboard, ClipboardMode};
 use crate::config::ThemeName;
 use crate::discord::{Bridge, RemoteCommand};
@@ -129,7 +129,7 @@ struct Entry {
 /// back to the channel that asked for it. `base` is where those lines start in
 /// `entries`, so the reply says exactly what the window showed.
 struct Capture {
-    channel: String,
+    origin: Origin,
     request: String,
     base: usize,
 }
@@ -567,7 +567,7 @@ pub struct App {
     notice: Option<(String, Instant)>,
     discord: Option<Arc<Bridge>>,
     capture: Option<Capture>,
-    remote_queue: VecDeque<(String, String)>,
+    remote_queue: VecDeque<(Origin, String)>,
     agent_touched: bool,
 }
 
@@ -816,7 +816,7 @@ impl App {
                 }
                 self.pending_tool = None;
             }
-            AgentEvent::AssistantDone { text } => {
+            AgentEvent::AssistantDone { text, .. } => {
                 let streamed = self.pending.take();
                 match streamed {
                     Some(p) if !p.text.trim().is_empty() => {
@@ -852,7 +852,7 @@ impl App {
                     Kind::Info,
                 );
             }
-            AgentEvent::Idle => {
+            AgentEvent::Idle { .. } => {
                 self.busy = false;
                 self.status = "idle".to_string();
                 self.current_tool = None;
@@ -876,7 +876,7 @@ impl App {
                 self.session_name = session_name;
                 self.pwd = PathBuf::from(pwd);
             }
-            AgentEvent::Error(message) => {
+            AgentEvent::Error { message, .. } => {
                 self.push(message, Kind::Error);
             }
         }
@@ -1370,7 +1370,13 @@ impl App {
         self.push(display.to_string(), Kind::User);
         self.busy = true;
         self.status = "thinking".to_string();
-        self.send_to_agent(agent, AgentCommand::Prompt { text });
+        self.send_to_agent(
+            agent,
+            AgentCommand::Prompt {
+                text,
+                origin: Origin::Local,
+            },
+        );
     }
 
     fn show_help(&mut self) {
@@ -1556,11 +1562,10 @@ impl App {
         agent: &mpsc::UnboundedSender<AgentCommand>,
     ) {
         if self.busy || self.capture.is_some() || !self.remote_queue.is_empty() {
-            self.remote_queue
-                .push_back((command.channel_id, command.text));
+            self.remote_queue.push_back((command.origin, command.text));
             return;
         }
-        self.run_remote(&command.channel_id, &command.text, agent);
+        self.run_remote(&command.origin, &command.text, agent);
     }
 
     /// The agent went idle: whatever the mirrored command was still waiting for
@@ -1570,8 +1575,8 @@ impl App {
         if self.capture.is_some() {
             self.post_capture(false);
         }
-        while let Some((channel, text)) = self.remote_queue.pop_front() {
-            self.run_remote(&channel, &text, agent);
+        while let Some((origin, text)) = self.remote_queue.pop_front() {
+            self.run_remote(&origin, &text, agent);
             if self.capture.is_some() {
                 break;
             }
@@ -1580,14 +1585,14 @@ impl App {
 
     fn run_remote(
         &mut self,
-        channel: &str,
+        origin: &Origin,
         text: &str,
         agent: &mpsc::UnboundedSender<AgentCommand>,
     ) {
         let action = classify_input(text, &self.template_names());
         self.agent_touched = false;
         self.capture = Some(Capture {
-            channel: channel.to_string(),
+            origin: origin.clone(),
             request: text.to_string(),
             base: self.entries.len(),
         });
@@ -1639,7 +1644,7 @@ impl App {
             lines.join("\n\n")
         };
         if let Some(bridge) = self.discord.clone() {
-            bridge.post_reply(&capture.channel, &body);
+            bridge.post_reply(&capture.origin, &body);
         }
         if !keep_open {
             self.capture = None;
@@ -1825,7 +1830,7 @@ async fn run_inner(
             maybe_event = events.recv() => {
                 match maybe_event {
                     Ok(event) => {
-                        let idle = matches!(event, AgentEvent::Idle);
+                        let idle = matches!(event, AgentEvent::Idle { .. });
                         app.on_event(event);
                         if idle {
                             app.remote_idle(&agent);
@@ -1983,7 +1988,7 @@ mod tests {
         );
         app.on_submit(":greet world", &tx);
         match rx.try_recv().unwrap() {
-            AgentCommand::Prompt { text } => assert_eq!(text, "hello world"),
+            AgentCommand::Prompt { text, .. } => assert_eq!(text, "hello world"),
             other => panic!("unexpected command: {other:?}"),
         }
         assert!(app.entries.iter().any(|e| e.text == ":greet world"));
@@ -2012,6 +2017,7 @@ mod tests {
         assert_eq!(app.pending.as_ref().unwrap().text, "Hello");
         app.on_event(AgentEvent::AssistantDone {
             text: "Hello".into(),
+            origin: Origin::Local,
         });
         assert!(app.pending.is_none());
         assert_eq!(app.entries.iter().filter(|e| e.text == "Hello").count(), 1);
@@ -2023,6 +2029,7 @@ mod tests {
         let mut app = test_app();
         app.on_event(AgentEvent::AssistantDone {
             text: "Direct".into(),
+            origin: Origin::Local,
         });
         assert_eq!(app.entries.iter().filter(|e| e.text == "Direct").count(), 1);
     }
@@ -2163,7 +2170,7 @@ mod tests {
             &cancel,
         );
         match rx.try_recv().unwrap() {
-            AgentCommand::Prompt { text } => assert_eq!(text, "line one\nline two"),
+            AgentCommand::Prompt { text, .. } => assert_eq!(text, "line one\nline two"),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -2582,7 +2589,6 @@ mod draw_tests {
         let config = DiscordConfig {
             enabled: true,
             bot_token: "tok".to_string(),
-            channel_id: "chan".to_string(),
             allowed_user_id: "42".to_string(),
         };
         app.discord = Some(Arc::new(Bridge::new(&config, events, false)));
@@ -2595,7 +2601,10 @@ mod draw_tests {
             .join("\n");
         assert!(text.contains("connecting to the gateway"), "{text}");
         assert!(text.contains("allowed_user_id: 42"), "{text}");
-        assert!(text.contains("fallback channel: chan"), "{text}");
+        assert!(
+            text.contains("answers go back to the DM or channel"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2623,7 +2632,7 @@ mod draw_tests {
     fn notes_and_faults_keep_their_kind_in_the_transcript() {
         let mut app = test_app();
         app.on_event(AgentEvent::Info(
-            "discord: answering #9 with 1 chunk".to_string(),
+            "discord: answering DM #9 with 1 chunk".to_string(),
         ));
         app.on_event(AgentEvent::Fault(
             "discord: could not post a reply: #9: discord REST 403: Missing Permissions"
@@ -2632,7 +2641,7 @@ mod draw_tests {
         assert!(app
             .entries
             .iter()
-            .any(|e| e.kind == Kind::Info && e.text.contains("answering #9")));
+            .any(|e| e.kind == Kind::Info && e.text.contains("answering DM #9")));
         assert!(app
             .entries
             .iter()
@@ -2646,7 +2655,6 @@ mod draw_tests {
         let config = DiscordConfig {
             enabled: true,
             bot_token: "tok".to_string(),
-            channel_id: "chan".to_string(),
             allowed_user_id: String::new(),
         };
         let bridge = Arc::new(Bridge::new(&config, events, false));
@@ -2750,7 +2758,6 @@ mod remote_tests {
         let config = DiscordConfig {
             enabled: true,
             bot_token: "tok".to_string(),
-            channel_id: String::new(),
             allowed_user_id: "42".to_string(),
         };
         let bridge = Arc::new(Bridge::new(&config, events, false));
@@ -2772,7 +2779,7 @@ mod remote_tests {
 
     fn command(text: &str) -> RemoteCommand {
         RemoteCommand {
-            channel_id: "9".to_string(),
+            origin: Origin::Channel("9".to_string()),
             text: text.to_string(),
         }
     }
@@ -2909,6 +2916,41 @@ mod remote_tests {
         let said = answers.try_recv().unwrap();
         assert!(said.text.contains(":name rho"), "{}", said.text);
         assert!(said.text.contains("produced no output"), "{}", said.text);
+    }
+
+    /// A command a DM asked for is answered in that DM, not in the channel the
+    /// bot happens to have been used in before.
+    #[test]
+    fn a_command_from_a_dm_is_answered_in_that_dm() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.on_remote(
+            RemoteCommand {
+                origin: Origin::Dm("7".to_string()),
+                text: ":help".to_string(),
+            },
+            &tx,
+        );
+
+        assert_eq!(answers.try_recv().unwrap().channel_id, "7");
+    }
+
+    /// The window mirrors what a remote command added to the transcript, and
+    /// nothing a prompt typed at the keyboard added.
+    #[test]
+    fn a_prompt_typed_at_the_keyboard_stays_out_of_discord() {
+        let (mut app, mut answers, _courtesies) = remote_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.submit_prompt("build it", "build it".to_string(), &tx);
+        app.on_event(AgentEvent::AssistantDone {
+            text: "done".into(),
+            origin: Origin::Local,
+        });
+        app.remote_idle(&tx);
+
+        assert!(answers.try_recv().is_err());
     }
 
     #[test]

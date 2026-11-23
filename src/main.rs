@@ -1,7 +1,7 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
-use rho::agent::{Agent, AgentCommand, AgentEvent};
+use rho::agent::{Agent, AgentCommand, AgentEvent, Origin};
 use rho::config::Config;
 use rho::session;
 use rho::templates::{self, template_dirs};
@@ -181,22 +181,33 @@ async fn run_print(
         eprintln!("no prompt given\n\n{USAGE}");
         std::process::exit(2);
     }
-    agent_tx.send(AgentCommand::Prompt { text: prompt })?;
+    agent_tx.send(AgentCommand::Prompt {
+        text: prompt,
+        origin: Origin::Local,
+    })?;
     let code;
     loop {
         match event_rx.recv().await {
-            Ok(AgentEvent::AssistantDone { text }) => {
+            Ok(AgentEvent::AssistantDone {
+                text,
+                origin: Origin::Local,
+            }) => {
                 println!("{text}");
                 let _ = std::io::stdout().flush();
                 code = 0;
                 break;
             }
-            Ok(AgentEvent::Error(e)) => {
-                eprintln!("error: {e}");
+            Ok(AgentEvent::Error {
+                message,
+                origin: Origin::Local,
+            }) => {
+                eprintln!("error: {message}");
                 code = 1;
                 break;
             }
-            Ok(AgentEvent::Idle) => {
+            Ok(AgentEvent::Idle {
+                origin: Origin::Local,
+            }) => {
                 eprintln!("error: agent finished without an answer");
                 code = 1;
                 break;

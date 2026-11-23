@@ -32,8 +32,6 @@ pub struct DiscordConfig {
     #[serde(default)]
     pub bot_token: String,
     #[serde(default)]
-    pub channel_id: String,
-    #[serde(default)]
     pub allowed_user_id: String,
 }
 
@@ -158,7 +156,6 @@ context_window: 100000
 discord:
   enabled: true
   bot_token: tok
-  channel_id: "123"
   allowed_user_id: "456"
 loop_config:
   max_turns_per_run: 10
@@ -178,11 +175,30 @@ compaction:
         assert_eq!(cfg.context_window, 100000);
         assert_eq!(cfg.theme, ThemeName::Dark);
         assert!(cfg.discord.enabled);
-        assert_eq!(cfg.discord.channel_id, "123");
+        assert_eq!(cfg.discord.allowed_user_id, "456");
         assert_eq!(cfg.loop_config.max_turns_per_run, 10);
         assert!(!cfg.compaction.enabled);
         assert_eq!(cfg.compaction.reserve_tokens, 8192);
         assert_eq!(cfg.compaction.keep_recent_tokens, 4096);
+    }
+
+    #[test]
+    fn a_config_naming_the_channel_replies_used_to_fall_back_to_still_loads() {
+        let yaml = r#"
+provider:
+  base_url: http://localhost:8000/v1
+model:
+  id: test-model
+discord:
+  enabled: true
+  bot_token: tok
+  channel_id: "123"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.discord.enabled);
     }
 
     #[test]

@@ -18,9 +18,48 @@ use crate::session::{self, SessionHeader};
 use crate::tools::{all_tools, Tool, ToolResult};
 use crate::types::Message;
 
+/// Who asked for the work an answer belongs to. rho shows every turn in its own
+/// transcript; only a turn asked for over Discord has somewhere else to answer,
+/// and then only in the channel that asked it. A DM is never answered in a
+/// server channel, and a prompt typed at the keyboard is never answered on
+/// Discord at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Origin {
+    #[default]
+    Local,
+    Dm(String),
+    Channel(String),
+}
+
+impl Origin {
+    /// The Discord channel this turn's answer belongs to, and `None` for a turn
+    /// rho was asked for itself.
+    pub fn channel(&self) -> Option<&str> {
+        match self {
+            Origin::Local => None,
+            Origin::Dm(channel) | Origin::Channel(channel) => Some(channel.as_str()),
+        }
+    }
+
+    /// Whether this turn has somewhere on Discord to answer. A turn asked for
+    /// in rho does not, and so is never posted.
+    pub fn asked_on_discord(&self) -> bool {
+        !matches!(self, Origin::Local)
+    }
+
+    /// Where the turn was asked for, in the words the transcript shows.
+    pub fn place(&self) -> String {
+        match self {
+            Origin::Local => "rho".to_string(),
+            Origin::Dm(channel) => format!("DM #{channel}"),
+            Origin::Channel(channel) => format!("channel #{channel}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AgentCommand {
-    Prompt { text: String },
+    Prompt { text: String, origin: Origin },
     Loop { spec: LoopSpec },
     Interrupt,
     Compact { instructions: Option<String> },
@@ -47,6 +86,7 @@ pub enum AgentEvent {
     },
     AssistantDone {
         text: String,
+        origin: Origin,
     },
     LoopStarted {
         description: String,
@@ -72,8 +112,16 @@ pub enum AgentEvent {
         session_name: Option<String>,
         pwd: String,
     },
-    Idle,
-    Error(String),
+    /// The command the agent was working on has finished, and `origin` says who
+    /// asked for it: the end of a turn is where a bridge stops showing the
+    /// channel it was asked in as typing, whether or not there is an answer.
+    Idle {
+        origin: Origin,
+    },
+    Error {
+        origin: Origin,
+        message: String,
+    },
 }
 
 pub struct Agent {
@@ -84,6 +132,7 @@ pub struct Agent {
     cancel: Arc<AtomicBool>,
     pwd: PathBuf,
     model: String,
+    turn: Origin,
     session_path: Option<PathBuf>,
     session_header: Option<SessionHeader>,
     truncation_recovery_used: bool,
@@ -140,8 +189,10 @@ impl Agent {
                     (h, Some(path), Some(header))
                 }
                 Err(e) => {
-                    let _ =
-                        events.send(AgentEvent::Error(format!("failed to resume session: {e}")));
+                    let _ = events.send(AgentEvent::Error {
+                        origin: Origin::Local,
+                        message: format!("failed to resume session: {e}"),
+                    });
                     (vec![system], None, None)
                 }
             },
@@ -155,6 +206,7 @@ impl Agent {
             history,
             cancel: cancel.clone(),
             pwd,
+            turn: Origin::Local,
             truncation_recovery_used: false,
             overflow_recovery_used: false,
             session_path,
@@ -170,8 +222,9 @@ impl Agent {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    AgentCommand::Prompt { text } => {
+                    AgentCommand::Prompt { text, origin } => {
                         agent.cancel.store(false, Ordering::SeqCst);
+                        agent.turn = origin;
                         agent.run_turn(&text, &events).await;
                     }
                     AgentCommand::Loop { spec } => {
@@ -206,8 +259,7 @@ impl Agent {
                             let _ = events.send(AgentEvent::Info("session resumed".to_string()));
                         }
                         Err(e) => {
-                            let _ = events
-                                .send(AgentEvent::Error(format!("failed to resume session: {e}")));
+                            agent.error(&events, format!("failed to resume session: {e}"));
                         }
                     },
                     AgentCommand::SetName { name } => {
@@ -222,10 +274,10 @@ impl Agent {
                     AgentCommand::SetModel { id } => {
                         let known = agent.known_models();
                         if !known.iter().any(|m| m == &id) {
-                            let _ = events.send(AgentEvent::Error(format!(
-                                "unknown model: {id} (available: {})",
-                                known.join(", ")
-                            )));
+                            agent.error(
+                                &events,
+                                format!("unknown model: {id} (available: {})", known.join(", ")),
+                            );
                         } else {
                             agent.model = id.clone();
                             let _ = events.send(AgentEvent::Info(format!("model: {id}")));
@@ -247,12 +299,13 @@ impl Agent {
                                 events.send(AgentEvent::Info(format!("pwd: {}", pwd.display())));
                         }
                         Err(e) => {
-                            let _ = events.send(AgentEvent::Error(e));
+                            agent.error(&events, e);
                         }
                     },
                 }
+                let finished = std::mem::replace(&mut agent.turn, Origin::Local);
                 agent.persist(&events);
-                let _ = events.send(AgentEvent::Idle);
+                let _ = events.send(AgentEvent::Idle { origin: finished });
             }
         });
         (tx, cancel)
@@ -308,6 +361,20 @@ impl Agent {
         });
     }
 
+    fn error(&self, events: &broadcast::Sender<AgentEvent>, message: impl Into<String>) {
+        let _ = events.send(AgentEvent::Error {
+            origin: self.turn.clone(),
+            message: message.into(),
+        });
+    }
+
+    fn answer(&self, events: &broadcast::Sender<AgentEvent>, text: String) {
+        let _ = events.send(AgentEvent::AssistantDone {
+            text,
+            origin: self.turn.clone(),
+        });
+    }
+
     fn persist(&self, events: &broadcast::Sender<AgentEvent>) {
         if let (Some(path), Some(header)) = (&self.session_path, &self.session_header) {
             let mut header = header.clone();
@@ -319,7 +386,7 @@ impl Agent {
                 .cloned()
                 .collect();
             if let Err(e) = session::save_session(path, &header, &messages) {
-                let _ = events.send(AgentEvent::Error(format!("failed to save session: {e}")));
+                self.error(events, format!("failed to save session: {e}"));
             }
         }
         self.send_usage(events);
@@ -386,13 +453,14 @@ impl Agent {
         let summary = match result {
             Ok(answer) if !answer.content.trim().is_empty() => answer.content.trim().to_string(),
             Ok(_) => {
-                let _ = events.send(AgentEvent::Error(
-                    "compaction produced an empty summary; history unchanged".to_string(),
-                ));
+                self.error(
+                    events,
+                    "compaction produced an empty summary; history unchanged",
+                );
                 return false;
             }
             Err(e) => {
-                let _ = events.send(AgentEvent::Error(format!("compaction failed: {e}")));
+                self.error(events, format!("compaction failed: {e}"));
                 return false;
             }
         };
@@ -409,7 +477,7 @@ impl Agent {
         self.history.push(Message::user(user_text));
         self.send_usage(events);
         if let Err(e) = self.drive(events).await {
-            let _ = events.send(AgentEvent::Error(e.to_string()));
+            self.error(events, e.to_string());
         }
     }
 
@@ -481,9 +549,10 @@ impl Agent {
                         if self.compact_now(None, events, false).await {
                             continue;
                         }
-                        let _ = events.send(AgentEvent::Error(
-                            "context overflow recovery failed: nothing left to compact".to_string(),
-                        ));
+                        self.error(
+                            events,
+                            "context overflow recovery failed: nothing left to compact",
+                        );
                     }
                     return Err(e);
                 }
@@ -531,14 +600,12 @@ impl Agent {
                     self.compact_now(None, events, false).await;
                     continue;
                 }
-                let _ = events.send(AgentEvent::Error(
-                    "Response was truncated before completion.".to_string(),
-                ));
-                let _ = events.send(AgentEvent::Error(
-                    "truncated response recovery failed after one compact-and-retry attempt"
-                        .to_string(),
-                ));
-                let _ = events.send(AgentEvent::AssistantDone { text });
+                self.error(events, "Response was truncated before completion.");
+                self.error(
+                    events,
+                    "truncated response recovery failed after one compact-and-retry attempt",
+                );
+                self.answer(events, text);
                 return Ok(());
             }
 
@@ -564,9 +631,7 @@ impl Agent {
             self.send_usage(events);
 
             if assistant.tool_calls.is_empty() {
-                let _ = events.send(AgentEvent::AssistantDone {
-                    text: assistant.content.clone(),
-                });
+                self.answer(events, assistant.content.clone());
                 return Ok(());
             }
 
@@ -600,9 +665,7 @@ impl Agent {
                 self.send_usage(events);
             }
         }
-        let _ = events.send(AgentEvent::Error(
-            "max turns reached without a final answer".to_string(),
-        ));
+        self.error(events, "max turns reached without a final answer");
         Ok(())
     }
 
@@ -636,7 +699,7 @@ impl Agent {
                 _ => {}
             }
             if let Err(e) = self.drive(events).await {
-                let _ = events.send(AgentEvent::Error(e.to_string()));
+                self.error(events, e.to_string());
                 break "error".to_string();
             }
             if self.cancelled() {
@@ -692,6 +755,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn test_config() -> Config {
         serde_yaml::from_str(
@@ -714,6 +778,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             pwd: dir.path().to_path_buf(),
             config,
+            turn: Origin::Local,
             session_path: None,
             session_header: None,
             truncation_recovery_used: false,
@@ -826,5 +891,54 @@ mod tests {
         let file = d.path().join("f.txt");
         std::fs::write(&file, "x").unwrap();
         assert!(Agent::resolve_pwd(d.path(), &file).is_err());
+    }
+
+    /// The origin of a prompt survives to the end of its turn, which is what
+    /// lets a bridge answer where it was asked and stay quiet elsewhere.
+    #[tokio::test]
+    async fn a_turn_ends_with_the_origin_it_started_with() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = broadcast::channel(64);
+        let (agent, _cancel) = with_state_home(state.path(), || {
+            Agent::spawn(test_config(), dir.path().to_path_buf(), tx)
+        });
+
+        let asked = Origin::Dm("7".to_string());
+        agent
+            .send(AgentCommand::Prompt {
+                text: "build it".to_string(),
+                origin: asked.clone(),
+            })
+            .unwrap();
+        let (answer, idle) = tokio::time::timeout(Duration::from_secs(30), next_turn(&mut rx))
+            .await
+            .expect("the turn never ended");
+        assert_eq!(answer.as_ref(), Some(&asked));
+        assert_eq!(idle, asked);
+
+        agent
+            .send(AgentCommand::SetName {
+                name: "typed here".to_string(),
+            })
+            .unwrap();
+        let (answer, idle) = tokio::time::timeout(Duration::from_secs(30), next_turn(&mut rx))
+            .await
+            .expect("the command never ended");
+        assert_eq!(answer, None);
+        assert_eq!(idle, Origin::Local);
+    }
+
+    async fn next_turn(rx: &mut broadcast::Receiver<AgentEvent>) -> (Option<Origin>, Origin) {
+        let mut answer = None;
+        loop {
+            match rx.recv().await.unwrap() {
+                AgentEvent::AssistantDone { origin, .. } | AgentEvent::Error { origin, .. } => {
+                    answer = Some(origin)
+                }
+                AgentEvent::Idle { origin } => return (answer, origin),
+                _ => {}
+            }
+        }
     }
 }

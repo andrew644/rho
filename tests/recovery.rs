@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use rho::agent::{Agent, AgentCommand, AgentEvent};
+use rho::agent::{Agent, AgentCommand, AgentEvent, Origin};
 use rho::config::{
     CompactionConfig, Config, DiscordConfig, LoopConfig, ModelConfig, ProviderConfig, ThemeName,
 };
@@ -186,6 +186,7 @@ async fn truncated_tool_call_keeps_session_usable() {
     agent
         .send(AgentCommand::Prompt {
             text: "run the command".to_string(),
+            origin: Origin::Local,
         })
         .unwrap();
 
@@ -198,13 +199,15 @@ async fn truncated_tool_call_keeps_session_usable() {
                 AgentEvent::Info(message) if message.contains("compacting and retrying") => {
                     saw_compact_note = true;
                 }
-                AgentEvent::Error(message) if message.contains("truncated before completion") => {
+                AgentEvent::Error { message, .. }
+                    if message.contains("truncated before completion") =>
+                {
                     saw_truncated_note = true;
                 }
-                AgentEvent::Error(message) if message.contains("compact-and-retry") => {
+                AgentEvent::Error { message, .. } if message.contains("compact-and-retry") => {
                     saw_error_note = true;
                 }
-                AgentEvent::Idle => break,
+                AgentEvent::Idle { .. } => break,
                 _ => {}
             }
         }
@@ -220,12 +223,13 @@ async fn truncated_tool_call_keeps_session_usable() {
     agent
         .send(AgentCommand::Prompt {
             text: "continue".to_string(),
+            origin: Origin::Local,
         })
         .unwrap();
 
     let reply = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let AgentEvent::AssistantDone { text } = rx.recv().await.unwrap() {
+            if let AgentEvent::AssistantDone { text, .. } = rx.recv().await.unwrap() {
                 return text;
             }
         }
@@ -311,11 +315,12 @@ async fn context_overflow_compacts_and_retries() {
     agent
         .send(AgentCommand::Prompt {
             text: "first question".to_string(),
+            origin: Origin::Local,
         })
         .unwrap();
     let first = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let AgentEvent::AssistantDone { text } = rx.recv().await.unwrap() {
+            if let AgentEvent::AssistantDone { text, .. } = rx.recv().await.unwrap() {
                 break text;
             }
         }
@@ -327,6 +332,7 @@ async fn context_overflow_compacts_and_retries() {
     agent
         .send(AgentCommand::Prompt {
             text: "second question".repeat(80),
+            origin: Origin::Local,
         })
         .unwrap();
 
@@ -342,8 +348,8 @@ async fn context_overflow_compacts_and_retries() {
                 AgentEvent::Info(message) if message.contains("compacted") => {
                     saw_compaction = true;
                 }
-                AgentEvent::Error(message) => errors.push(message),
-                AgentEvent::AssistantDone { text } => break text,
+                AgentEvent::Error { message, .. } => errors.push(message),
+                AgentEvent::AssistantDone { text, .. } => break text,
                 _ => {}
             }
         }

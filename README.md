@@ -25,7 +25,6 @@ model:
 # discord:
 #   enabled: true
 #   bot_token: "..."
-#   channel_id: "..."        # optional; where prompts with no Discord origin go
 #   allowed_user_id: "..."   # your Discord user id; restricts who may drive the agent
 # loop_config:
 #   max_turns_per_run: 64
@@ -169,12 +168,18 @@ of — into the same serial prompt queue as the TUI; final answers are posted
 back, split at 2000 chars. No channel has to be configured for the bot to
 hear you.
 
-Replies go back to the channel the question came from: DM the bot and the
-answer appears in the DM, post in a server channel and it appears in that
-channel. `channel_id` is only the fallback destination, used for prompts that
-have no Discord origin (typed in the TUI or `rho -p`); leave it empty and
-those are not mirrored to Discord, while messages sent to the bot still get
-answered where they were sent.
+A turn is answered where it was asked for, and nowhere else:
+
+| asked in | the answer goes |
+| --- | --- |
+| a DM to the bot | that DM, and the rho window |
+| a server channel | that channel, and the rho window |
+| the rho window (`rho -p` too) | the rho window only |
+
+A DM is never answered in a server channel, and typing a prompt at the
+keyboard never posts to Discord. `discord.channel_id` is gone: there is no
+longer a channel for prompts to fall back to, and an old config that still
+names one simply has that key ignored.
 
 Because a server channel needs no configuration, set `allowed_user_id`: while
 it is empty anyone who can DM the bot or who shares a server with it can drive
@@ -242,9 +247,9 @@ line, so if nothing appears at all, Discord never sent it:
 - `@alice in server "Work" #9: not queued — the agent is not accepting prompts
   (channel closed)` — the message reached the gateway but never reached the
   agent, so no answer was ever coming.
-- `discord: no answer came for #9, so its typing indicator was dropped` — the
-  turn was interrupted before it produced an answer, so nothing is still being
-  written in that channel.
+- `discord: the turn asked for in DM #7 ended with no answer to post, so its
+  typing indicator stopped` — the turn was interrupted before it produced an
+  answer, so nothing is still being written in that channel.
 
 Anything the bridge *fails* to do is drawn as an error line (`! `, in red)
 rather than as a note (`· `): a gateway that closes, stops or loses the Message
@@ -263,9 +268,10 @@ Discord granted, the servers the bot can see, how many messages arrived, how
 many were queued as prompts and how many as commands, how many reply chunks
 went out, the last inbound line, how many reactions and typing indicators went
 out and how many Discord refused, how many errors were reported and the last of
-them (its own lines turn red when they are reporting one). Messages from other
-bots are counted but only mentioned the first time, so a busy channel cannot
-push your transcript along.
+them (its own lines turn red when they are reporting one), plus where answers
+go: back to the DM or channel that asked for them, never anywhere else. Messages
+from other bots are counted but only mentioned the first time, so a busy channel
+cannot push your transcript along.
 
 Outgoing replies are throttled to 4 messages per 5 s window and a `429` is
 retried after the `Retry-After` Discord reports (up to 3 attempts); a full

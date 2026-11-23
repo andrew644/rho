@@ -168,7 +168,6 @@ compaction:
 discord:
   enabled: false
   bot_token: ""
-  channel_id: ""
   allowed_user_id: ""
 loop:
   max_turns_per_run: 64
@@ -204,15 +203,17 @@ loop:
   re-identify, anything else resumes. Wait between attempts doubles from 1 s
   to 60 s with jitter and resets once a session identifies.
 - Incoming `MESSAGE_CREATE` from the allowed user, in any DM or server channel
-  the bot can see (`channel_id` never filters inbound messages): prompt text is
-  enqueued as an agent prompt and the channel becomes the reply target, so
-  answers go back where the question was asked; the configured `channel_id` is
-  the fallback for prompts with no Discord origin (TUI, `rho -p`). Agent
-  replies (final assistant text, split at 2000 chars) go to a bounded outbox
-  drained by a worker that POSTs `/channels/{id}/messages` with
-  `Authorization: Bot <token>` (Discord rejects `Bearer` for bot tokens with
-  `401`) at 4 messages per 5 s, so chunk bursts stay under Discord's
-  per-channel limit.
+  the bot can see: prompt text is enqueued as an agent prompt carrying the
+  `Origin` it was asked in (`Dm(channel)` or `Channel(channel)`), and that
+  origin is the only place its answer will ever be posted — the agent stamps
+  every answer, failure and end-of-turn with the origin of the turn it belongs
+  to, and a turn asked for in the window itself carries `Origin::Local`, which
+  has no Discord destination at all. A DM answer therefore never reaches a
+  server channel and a prompt typed in rho (or `rho -p`) never reaches Discord.
+  Answers go to a bounded outbox drained by a worker that POSTs
+  `/channels/{id}/messages` with `Authorization: Bot <token>` (Discord rejects
+  `Bearer` for bot tokens with `401`) at 4 messages per 5 s, so chunk bursts
+  stay under Discord's per-channel limit.
 - Text that reads as a command (`:compact`, `:model gpt`, `!cargo test`,
   `!!git status` — the same rule `classify_input` applies to the input) is not
   a prompt: it goes over a queue to the TUI, which is what owns every command,
@@ -236,8 +237,9 @@ loop:
   reply, and the gateway read loop never waits on one. `TypingBoard` keeps one
   episode per prompt (refcounted per channel, so a second prompt in a channel
   keeps the banner up while the first answer is posted): the answer stops it, an
-  `Idle` with no answer before it drops the oldest episode (an interrupted turn
-  owes no reply), a lagged or closed event stream clears them all, and an
+  `Idle` carrying that prompt's origin stops it too when the turn had no answer
+  (an interrupted turn owes no reply, and no other channel's banner is touched),
+  a lagged or closed event stream clears them all, and an
   episode older than 5 min is abandoned with a note, so a lost stop cannot
   pretend to type forever. Reactions need the *Add Reactions* and *Read
   Message History* permissions (in servers only; DMs need neither); the
@@ -248,7 +250,8 @@ loop:
   transcript line (only headless runs, which have no TUI, write them to
   stderr). Routine news is `Info` and anything the bridge failed to do is a
   `Fault`, which the transcript draws as an error line and the reply relay —
-  which answers the agent's own `Error` text — can never mistake for an answer.
+  which answers a Discord turn with its `Error` text only when that turn never
+  produced an answer — can never mistake for an answer.
   `READY` reports the intents Discord granted and faults when it did not grant
   the privileged one, each `GUILD_CREATE` reports the server name/id and whether
   it is available, every `MESSAGE_CREATE` reports who sent it from where and
